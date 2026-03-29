@@ -1,1 +1,106 @@
+{
+  "useBot": true,
 
+  "name": "AFK Bot",
+
+  "bot-account": {
+    "username": "afkBOT",
+    "password": "",
+    "type": "offline"
+  },
+
+  "server": {
+    "ip": "your.server.ip",
+    "port": 25565,
+    "version": "",
+    "try-creative": true
+  },
+
+  "position": {
+    "enabled": false,
+    "x": 0,
+    "y": 100,
+    "z": 0
+  },
+
+  "utils": {
+    "auto-auth": {
+      "enabled": true,
+      "password": "yourpassword"
+    },
+
+    "anti-afk": {
+      "enabled": true,
+      "sneak": true
+    },
+
+    "chat-messages": {
+      "enabled": false,
+      "repeat": true,
+      "repeat-delay": 120,
+      "messages": [
+        "I'm just playing",
+        "AFK but online",
+        "Hello everyone!"
+      ]
+    },
+
+    "chat-log": true,
+
+    "auto-reconnect": true,
+    "auto-reconnect-delay": 1000,
+    "max-reconnect-delay": 60000
+  },
+
+  "movement": {
+    "enabled": true,
+
+    "circle-walk": {
+      "enabled": false,
+      "radius": 4,
+      "speed": 3000
+    },
+
+    "look-around": {
+      "enabled": true,
+      "interval": 5000
+    },
+
+    "random-jump": {
+      "enabled": true,
+      "interval": 10000
+    }
+  },
+
+  "modules": {
+    "avoidMobs": true,
+    "combat": false,
+    "beds": false,
+    "chat": true,
+    "console-commands": true
+  },
+
+  "combat": {
+    "attack-mobs": false,
+    "auto-eat": true
+  },
+
+  "beds": {
+    "pick-up-day": false,
+    "place-night": false
+  },
+
+  "discord": {
+    "enabled": false,
+    "webhookUrl": "PASTE_YOUR_WEBHOOK_HERE",
+    "events": {
+      "connect": true,
+      "disconnect": true,
+      "chat": false
+    }
+  },
+
+  "chat": {
+    "respond": false
+  }
+}
