@@ -29,7 +29,7 @@ app.listen(PORT, () => {
 // ================= STATE =================
 let bots = [];
 
-// ================= PERFORMANCE OPTIMIZED DISCORD =================
+// ================= DISCORD =================
 let lastDiscordSend = 0;
 const DISCORD_COOLDOWN = 5000;
 
@@ -44,10 +44,10 @@ function sendDiscordWebhook(botConfig, content, color = 0x00ff00) {
   const protocol = url.protocol === 'https:' ? https : http;
 
   const payload = JSON.stringify({
-    username: config.name,
+    username: botConfig.name || "Bot", // FIXED (was config.name)
     embeds: [{
       description: content,
-      color: color,
+      color,
       timestamp: new Date().toISOString(),
       footer: { text: 'Slobos AFK Bot' }
     }]
@@ -84,7 +84,7 @@ function createBot(botConfig, label = 'Bot') {
     version: false
   });
 
-  bots.push(bot);
+  // FIX: prevent duplicate push
   if (!bots.includes(bot)) bots.push(bot);
 
   bot.loadPlugin(pathfinder);
@@ -92,22 +92,25 @@ function createBot(botConfig, label = 'Bot') {
   let reconnectAttempts = 0;
   let intervals = [];
 
-  // ================= CLEANUP HELPER =================
   const clearAllIntervals = () => {
     for (const id of intervals) clearInterval(id);
     intervals = [];
   };
 
-  // ================= SPAWN =================
   bot.once('spawn', () => {
     console.log(`[${label}] Connected`);
 
-    sendDiscordWebhook(botConfig, `[+] **Connected** to \`${config.server.ip}\``, 0x4ade80);
+    // FIXED template string + config bug
+    sendDiscordWebhook(
+      botConfig,
+      `[+] **Connected** to \`${botConfig.server.ip}\``,
+      0x4ade80
+    );
 
     reconnectAttempts = 0;
 
     const mcData = require('minecraft-data')(bot.version);
-    const defaultMove = new Movements(bot, mcData);
+    new Movements(bot, mcData);
 
     // ================= AUTO AUTH =================
     if (botConfig.utils['auto-auth']?.enabled) {
@@ -119,7 +122,7 @@ function createBot(botConfig, label = 'Bot') {
       }, 3000);
     }
 
-    // ================= ANTI AFK (OPTIMIZED INTERVAL TRACKING) =================
+    // ================= ANTI AFK =================
     if (botConfig.utils['anti-afk']?.enabled) {
       intervals.push(setInterval(() => {
         try { bot.swingArm(); } catch {}
@@ -130,7 +133,7 @@ function createBot(botConfig, label = 'Bot') {
       }, 60000));
     }
 
-    // ================= CHAT MESSAGES =================
+    // ================= CHAT =================
     if (botConfig.utils['chat-messages']?.enabled) {
       const msgs = botConfig.utils['chat-messages'].messages;
       let i = 0;
@@ -165,7 +168,11 @@ function createBot(botConfig, label = 'Bot') {
     console.log(`[${label}] ${username}: ${message}`);
 
     if (botConfig.discord?.events?.chat) {
-      sendDiscordWebhook(botConfig, `💬 **${username}**: ${message}`, 0x7289da);
+      sendDiscordWebhook(
+        botConfig,
+        `💬 **${username}**: ${message}`,
+        0x7289da
+      );
     }
 
     if (botConfig.chat?.respond && message.toLowerCase().includes('hi')) {
@@ -176,15 +183,25 @@ function createBot(botConfig, label = 'Bot') {
   // ================= KICK =================
   bot.on('kicked', (reason) => {
     console.log(`[${label}] Kicked:`, reason);
-    sendDiscordWebhook(botConfig, `[!] **Kicked**: ${kickReason}`, 0xff0000);
+
+    sendDiscordWebhook(
+      botConfig,
+      `[!] **Kicked**: ${reason}`, // FIXED (was kickReason undefined)
+      0xff0000
+    );
+
     clearAllIntervals();
   });
 
-  // ================= DISCONNECT =================
+  // ================= END =================
   bot.on('end', (reason) => {
     console.log(`[${label}] Disconnected`);
 
-    sendDiscordWebhook(botConfig, "[-] **Disconnected**: ${reason || 'Unknown'}`, 0xf87171));
+    sendDiscordWebhook(
+      botConfig,
+      `[-] **Disconnected**: ${reason || 'Unknown'}`, // FIXED template string
+      0xf87171
+    );
 
     clearAllIntervals();
 
