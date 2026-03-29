@@ -4,14 +4,14 @@
   "name": "AFK Bot",
 
   "bot-account": {
-    "username": "afkBOT",
+    "username": "BOTtwo",
     "password": "",
     "type": "offline"
   },
 
   "server": {
-    "ip": "your.server.ip",
-    "port": 25565,
+    "ip": "Luxxurryyyyy.aternos.me",
+    "port": 27441,
     "version": "",
     "try-creative": true
   },
@@ -25,7 +25,7 @@
 
   "utils": {
     "auto-auth": {
-      "enabled": true,
+      "enabled": false,
       "password": "yourpassword"
     },
 
@@ -91,12 +91,12 @@
   },
 
   "discord": {
-    "enabled": false,
-    "webhookUrl": "PASTE_YOUR_WEBHOOK_HERE",
+    "enabled": true,
+    "webhookUrl": "https://discord.com/api/webhooks/1487728930382413834/CDpaUZSX1po4XrpTuyFbS-upD4Bsu297yEmRHC0ZZ87HZn_J3Caf4KGyIgSIqyjjn19o",
     "events": {
       "connect": true,
       "disconnect": true,
-      "chat": false
+      "chat": true
     }
   },
 
