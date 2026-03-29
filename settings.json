@@ -1,7 +1,7 @@
 {
   "name": "AFK Bot",
   "bot-account": {
-    "username": "adminBOT",
+    "username": "afkBOT",
     "password": "",
     "type": "offline"
   },
@@ -20,7 +20,7 @@
   "utils": {
     "auto-auth": {
       "enabled": true,
-      "password": "chalol78"
+      "password": "pass123"
     },
     "anti-afk": {
       "enabled": false,
@@ -59,8 +59,8 @@
   },
   "modules": {
     "avoidMobs": false,
-    "combat": false,
-    "beds": false,
+    "combat": true,
+    "beds": true,
     "chat": true,
     "console-commands": true
   },
