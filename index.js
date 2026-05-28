@@ -1,243 +1,118 @@
-'use strict';
-
 const mineflayer = require('mineflayer');
-const { Movements, pathfinder, goals } = require('mineflayer-pathfinder');
-const { GoalBlock } = goals;
-const fs = require('fs');
-const express = require('express');
-const http = require('http');
-const https = require('https');
 
-// ================= CONFIG =================
-const config1 = require('./settings.json');
-let config2 = fs.existsSync('./settings2.json')
-  ? require('./settings2.json')
-  : null;
+// ===== CONFIG =====
+const config = {
+  host: 'quarrelsmp.mcsh.io', // Example: play.example.com
+  port: 25565,            // Example: 25565
+  username: 'admin',    // Change bot username
+  version: false,         // Auto-detect version
+  password: 'passwordis123'
+};
 
-// ================= EXPRESS =================
-const app = express();
-const PORT = process.env.PORT || 5000;
-
-app.get('/', (req, res) => {
-  res.send(`Bots running: ${bots.length}`);
+// ===== CREATE BOT =====
+const bot = mineflayer.createBot({
+  host: config.host,
+  port: config.port,
+  username: config.username,
+  version: config.version
 });
 
-app.listen(PORT, () => {
-  console.log(`[Server] Running on port ${PORT}`);
+let authenticated = false;
+
+// ===== WHEN BOT JOINS =====
+bot.once('spawn', () => {
+  console.log(`[+] ${config.username} joined the server.`);
 });
 
-// ================= STATE =================
-let bots = [];
+// ===== AUTO REGISTER / LOGIN =====
+bot.on('messagestr', (message) => {
+  const msg = message.toLowerCase();
 
-// ================= DISCORD =================
-let lastDiscordSend = 0;
-const DISCORD_COOLDOWN = 5000;
+  console.log(`[CHAT] ${message}`);
 
-function sendDiscordWebhook(botConfig, content, color = 0x00ff00) {
-  if (!botConfig.discord?.enabled || !botConfig.discord.webhookUrl) return;
+  // Register if needed
+  if (!authenticated && (
+    msg.includes('/register') ||
+    msg.includes('register with') ||
+    msg.includes('please register')
+  )) {
+    console.log('[*] Registering account...');
+    bot.chat(`/register ${config.password} ${config.password}`);
 
-  const now = Date.now();
-  if (now - lastDiscordSend < DISCORD_COOLDOWN) return;
-  lastDiscordSend = now;
+    setTimeout(() => {
+      afterAuth();
+    }, 3000);
 
-  const url = new URL(botConfig.discord.webhookUrl);
-  const protocol = url.protocol === 'https:' ? https : http;
+    authenticated = true;
+  }
 
-  const payload = JSON.stringify({
-    username: botConfig.name || "Bot", // FIXED (was config.name)
-    embeds: [{
-      description: content,
-      color,
-      timestamp: new Date().toISOString(),
-      footer: { text: 'Slobos AFK Bot' }
-    }]
-  });
+  // Login if needed
+  else if (!authenticated && (
+    msg.includes('/login') ||
+    msg.includes('please login') ||
+    msg.includes('log in with')
+  )) {
+    console.log('[*] Logging in...');
+    bot.chat(`/login ${config.password}`);
 
-  const options = {
-    hostname: url.hostname,
-    path: url.pathname + url.search,
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(payload)
-    }
-  };
+    setTimeout(() => {
+      afterAuth();
+    }, 3000);
 
-  const req = protocol.request(options);
-  req.on('error', err => console.log('[Discord Error]', err.message));
-  req.write(payload);
-  req.end();
+    authenticated = true;
+  }
+});
+
+// ===== AFTER LOGIN / REGISTER =====
+function afterAuth() {
+  console.log('[*] Running commands...');
+
+  bot.chat('/supervanish');
+
+  setTimeout(() => {
+    bot.chat('/gamemode spectator');
+  }, 1500);
 }
 
-// ================= BOT CREATION =================
-function createBot(botConfig, label = 'Bot') {
-  if (!botConfig.useBot) return;
+// ===== ERROR HANDLING =====
+bot.on('kicked', (reason) => {
+  console.log('[!] Kicked:', reason);
+});
 
-  console.log(`[${label}] Connecting to ${botConfig.server.ip}`);
+bot.on('error', (err) => {
+  console.log('[!] Error:', err);
+});
 
-  const bot = mineflayer.createBot({
-    username: botConfig['bot-account'].username,
-    password: botConfig['bot-account'].password || undefined,
-    auth: botConfig['bot-account'].type,
-    host: botConfig.server.ip,
-    port: botConfig.server.port,
-    version: false
-  });
+bot.on('end', () => {
+  console.log('[!] Disconnected from server.');
+});
 
-  // FIX: prevent duplicate push
-  if (!bots.includes(bot)) bots.push(bot);
+// ===== ANTI-AFK (PREVENT SERVER TIMEOUT) =====
+// This helps keep the bot active on servers with AFK kick systems.
+// It does NOT bypass anti-cheat plugins.
 
-  bot.loadPlugin(pathfinder);
+setInterval(() => {
+  if (!bot.entity) return;
 
-  let reconnectAttempts = 0;
-  let intervals = [];
+  // Small head movement
+  const yaw = bot.entity.yaw + (Math.random() - 0.5) * 0.4;
+  const pitch = (Math.random() - 0.5) * 0.2;
+  bot.look(yaw, pitch, true);
 
-  const clearAllIntervals = () => {
-    for (const id of intervals) clearInterval(id);
-    intervals = [];
-  };
+  // Small legitimate movement
+  bot.setControlState('jump', true);
 
-  bot.once('spawn', () => {
-    console.log(`[${label}] Connected`);
+  setTimeout(() => {
+    bot.setControlState('jump', false);
+  }, 500);
 
-    // FIXED template string + config bug
-    sendDiscordWebhook(
-      botConfig,
-      `[+] **Connected** to \`${botConfig.server.ip}\``,
-      0x4ade80
-    );
+}, 30000);
 
-    reconnectAttempts = 0;
+// ===== OPTIONAL AUTO RECONNECT =====
 
-    const mcData = require('minecraft-data')(bot.version);
-    new Movements(bot, mcData);
-
-    // ================= AUTO AUTH =================
-    if (botConfig.utils['auto-auth']?.enabled) {
-      const pass = botConfig.utils['auto-auth'].password;
-
-      setTimeout(() => {
-        bot.chat(`/login ${pass}`);
-        bot.chat(`/register ${pass} ${pass}`);
-      }, 3000);
-    }
-
-    // ================= ANTI AFK =================
-    if (botConfig.utils['anti-afk']?.enabled) {
-      intervals.push(setInterval(() => {
-        try { bot.swingArm(); } catch {}
-      }, 30000));
-
-      intervals.push(setInterval(() => {
-        try { bot.setQuickBarSlot(Math.floor(Math.random() * 9)); } catch {}
-      }, 60000));
-    }
-
-    // ================= CHAT =================
-    if (botConfig.utils['chat-messages']?.enabled) {
-      const msgs = botConfig.utils['chat-messages'].messages;
-      let i = 0;
-
-      intervals.push(setInterval(() => {
-        bot.chat(msgs[i]);
-        i = (i + 1) % msgs.length;
-      }, botConfig.utils['chat-messages']['repeat-delay'] * 1000));
-    }
-
-    // ================= MOVEMENT =================
-    if (botConfig.movement?.['look-around']?.enabled) {
-      intervals.push(setInterval(() => {
-        const yaw = Math.random() * Math.PI * 2;
-        const pitch = (Math.random() * Math.PI / 2) - Math.PI / 4;
-        bot.look(yaw, pitch, false);
-      }, botConfig.movement['look-around'].interval));
-    }
-
-    if (botConfig.movement?.['random-jump']?.enabled) {
-      intervals.push(setInterval(() => {
-        bot.setControlState('jump', true);
-        setTimeout(() => bot.setControlState('jump', false), 300);
-      }, botConfig.movement['random-jump'].interval));
-    }
-  });
-
-  // ================= CHAT =================
-  bot.on('chat', (username, message) => {
-    if (username === bot.username) return;
-
-    console.log(`[${label}] ${username}: ${message}`);
-
-    if (botConfig.discord?.events?.chat) {
-      sendDiscordWebhook(
-        botConfig,
-        `💬 **${username}**: ${message}`,
-        0x7289da
-      );
-    }
-
-    if (botConfig.chat?.respond && message.toLowerCase().includes('hi')) {
-      bot.chat(`Hello ${username}`);
-    }
-  });
-
-  // ================= KICK =================
-  bot.on('kicked', (reason) => {
-    console.log(`[${label}] Kicked:`, reason);
-
-    sendDiscordWebhook(
-      botConfig,
-      `[!] **Kicked**: ${reason}`, // FIXED (was kickReason undefined)
-      0xff0000
-    );
-
-    clearAllIntervals();
-  });
-
-  // ================= END =================
-  bot.on('end', (reason) => {
-    console.log(`[${label}] Disconnected`);
-
-    sendDiscordWebhook(
-      botConfig,
-      `[-] **Disconnected**: ${reason || 'Unknown'}`, // FIXED template string
-      0xf87171
-    );
-
-    clearAllIntervals();
-
-    reconnectAttempts++;
-
-    const delay = Math.min(
-      (botConfig.utils['auto-reconnect-delay'] || 3000) * reconnectAttempts,
-      botConfig.utils['max-reconnect-delay'] || 30000
-    );
-
-    console.log(`[${label}] Reconnecting in ${delay}ms`);
-
-    setTimeout(() => createBot(botConfig, label), delay);
-  });
-
-  // ================= ERROR =================
-  bot.on('error', (err) => {
-    console.log(`[${label}] Error: ${err.message}`);
-  });
-}
-
-// ================= START =================
-let started = 0;
-
-if (config1.useBot) {
-  createBot(config1, 'Bot-1');
-  started++;
-}
-
-if (config2?.useBot) {
-  createBot(config2, 'Bot-2');
-  started++;
-}
-
-if (started === 0) {
-  console.log('[SYSTEM] No bots enabled');
-} else {
-  console.log(`[SYSTEM] ${started} bot(s) running`);
-}
+setInterval(() => {
+  if (!bot.player) {
+    console.log('[*] Attempting reconnect...');
+    process.exit();
+  }
+}, 10000);
