@@ -4,14 +4,14 @@
   "name": "AFK Bot",
 
   "bot-account": {
-    "username": "BOTone",
+    "username": "adminnpc",
     "password": "",
     "type": "offline"
   },
 
   "server": {
-    "ip": "jacob55tuna-LXD7.aternos.me",
-    "port": 34922,
+    "ip": "quarrelsmp.mcsh.io",
+    "port": 25565,
     "version": "",
     "try-creative": true
   },
@@ -25,13 +25,13 @@
 
   "utils": {
     "auto-auth": {
-      "enabled": false,
-      "password": "yourpassword"
+      "enabled": true,
+      "password": "passwordis123"
     },
 
     "anti-afk": {
-      "enabled": true,
-      "sneak": true
+      "enabled": false,
+      "sneak": false
     },
 
     "chat-messages": {
@@ -73,7 +73,7 @@
   },
 
   "modules": {
-    "avoidMobs": true,
+    "avoidMobs": false,
     "combat": false,
     "beds": false,
     "chat": true,
