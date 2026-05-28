@@ -3,9 +3,9 @@ const mineflayer = require('mineflayer');
 // ===== CONFIG =====
 const config = {
   host: 'quarrelsmp.mcsh.io', // Example: play.example.com
-  port: 25565,            // Example: 25565
-  username: 'admin',    // Change bot username
-  version: false,         // Auto-detect version
+  port: 25565,
+  username: 'admin',
+  version: false,
   password: 'passwordis123'
 };
 
@@ -18,10 +18,13 @@ const bot = mineflayer.createBot({
 });
 
 let authenticated = false;
+let joinTime = 0;
 
 // ===== WHEN BOT JOINS =====
 bot.once('spawn', () => {
+  joinTime = Date.now();
   console.log(`[+] ${config.username} joined the server.`);
+  console.log('[*] Waiting 5 seconds before login/register...');
 });
 
 // ===== AUTO REGISTER / LOGIN =====
@@ -30,36 +33,47 @@ bot.on('messagestr', (message) => {
 
   console.log(`[CHAT] ${message}`);
 
+  if (authenticated) return;
+
+  // Wait at least 5 seconds after joining
+  const timeSinceJoin = Date.now() - joinTime;
+
+  if (timeSinceJoin < 5000) {
+    return;
+  }
+
   // Register if needed
-  if (!authenticated && (
+  if (
     msg.includes('/register') ||
     msg.includes('register with') ||
     msg.includes('please register')
-  )) {
+  ) {
+    authenticated = true;
+
     console.log('[*] Registering account...');
+
     bot.chat(`/register ${config.password} ${config.password}`);
 
     setTimeout(() => {
       afterAuth();
-    }, 3000);
-
-    authenticated = true;
+    }, 5000);
   }
 
   // Login if needed
-  else if (!authenticated && (
+  else if (
     msg.includes('/login') ||
     msg.includes('please login') ||
     msg.includes('log in with')
-  )) {
+  ) {
+    authenticated = true;
+
     console.log('[*] Logging in...');
+
     bot.chat(`/login ${config.password}`);
 
     setTimeout(() => {
       afterAuth();
-    }, 3000);
-
-    authenticated = true;
+    }, 5000);
   }
 });
 
@@ -71,7 +85,7 @@ function afterAuth() {
 
   setTimeout(() => {
     bot.chat('/gamemode spectator');
-  }, 1500);
+  }, 2000);
 }
 
 // ===== ERROR HANDLING =====
@@ -87,32 +101,45 @@ bot.on('end', () => {
   console.log('[!] Disconnected from server.');
 });
 
-// ===== ANTI-AFK (PREVENT SERVER TIMEOUT) =====
-// This helps keep the bot active on servers with AFK kick systems.
-// It does NOT bypass anti-cheat plugins.
+// ===== ANTI-AFK =====
+// Keeps the bot active so many servers won't kick it for inactivity.
 
 setInterval(() => {
   if (!bot.entity) return;
 
-  // Small head movement
+  // Random head movement
   const yaw = bot.entity.yaw + (Math.random() - 0.5) * 0.4;
   const pitch = (Math.random() - 0.5) * 0.2;
+
   bot.look(yaw, pitch, true);
 
-  // Small legitimate movement
+  // Small jump
   bot.setControlState('jump', true);
 
   setTimeout(() => {
     bot.setControlState('jump', false);
-  }, 500);
+  }, 400);
 
 }, 30000);
 
-// ===== OPTIONAL AUTO RECONNECT =====
+/*
+========================
+INSTALLATION
+========================
 
-setInterval(() => {
-  if (!bot.player) {
-    console.log('[*] Attempting reconnect...');
-    process.exit();
-  }
-}, 10000);
+1. Install Node.js
+https://nodejs.org/
+
+2. Save this file as bot.js
+
+3. Install Mineflayer:
+
+npm init -y
+npm install mineflayer
+
+4. Edit the config section.
+
+5. Run the bot:
+
+node bot.js
+*/
