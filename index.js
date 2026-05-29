@@ -9,7 +9,7 @@ const http = require('http');
 const https = require('https');
 
 // ============================================================
-// EXPRESS SERVER - Keep Render/Aternos alive
+// EXPRESS SERVER - Keep Render/Aternos alive.
 // ============================================================
 const app = express();
 const PORT = process.env.PORT || 5000;
