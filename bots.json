@@ -1,0 +1,73 @@
+{
+  "globalSettings": {
+    "webhookUrl": "",
+    "checkInterval": 30000,
+    "autoReconnectDelay": 3000,
+    "maxReconnectDelay": 30000,
+    "webhookRetryAttempts": 3,
+    "webhookRetryDelay": 5000
+  },
+  "bots": [
+    {
+      "id": "bot-1",
+      "name": "AFK_Bot_01",
+      "password": "",
+      "serverIp": "mc.example.com",
+      "serverPort": 25565,
+      "serverVersion": "",
+      "authType": "offline",
+      "webhookUrl": "",
+      "enabled": true,
+      "autoReconnect": true,
+      "tryCreative": true,
+      "antiAfk": {
+        "enabled": true,
+        "sneak": true,
+        "swingArm": true,
+        "hotbarCycle": true,
+        "jumpInterval": 30000
+      },
+      "movement": {
+        "enabled": true,
+        "circleWalk": {
+          "enabled": true,
+          "radius": 5,
+          "speed": 3000
+        },
+        "randomJump": {
+          "enabled": false,
+          "interval": 15000
+        },
+        "lookAround": {
+          "enabled": true,
+          "interval": 20000
+        }
+      },
+      "autoAuth": {
+        "enabled": false,
+        "password": ""
+      },
+      "chatMessages": {
+        "enabled": false,
+        "messages": [],
+        "repeat": false,
+        "repeatDelay": 60
+      },
+      "position": {
+        "enabled": false,
+        "x": 0,
+        "y": 64,
+        "z": 0
+      },
+      "combat": {
+        "attackMobs": false,
+        "autoEat": false
+      },
+      "playerGuard": {
+        "enabled": true,
+        "evictOnPlayer": true,
+        "pollInterval": 30000
+      }
+    }
+  ]
+}
