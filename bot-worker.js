@@ -563,6 +563,11 @@ function stopBot(callback) {
   if (callback) callback();
 
   process.send({ type: 'BOT_STOPPED', botId: botId });
+
+  // Exit the worker process completely - no need to keep it running
+  // The parent will spawn a new worker if/when the bot is restarted
+  console.log(`[${botId}] Worker process exiting...`);
+  setTimeout(() => process.exit(0), 500); // Brief delay for BOT_STOPPED message to send
 }
 
 // ============================================================
