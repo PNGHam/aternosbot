@@ -141,6 +141,7 @@ function stopBotInstance(botId, callback) {
   const pInfo = botProcesses.get(botId);
 
   if (!pInfo || !pInfo.process) {
+    updateBotStatus(botId, { status: 'stopped', connected: false });
     if (callback) callback();
     return true;
   }
@@ -148,27 +149,56 @@ function stopBotInstance(botId, callback) {
   console.log(`[BotManager] Stopping bot: ${botId}`);
 
   pInfo.status = 'stopping';
+  updateBotStatus(botId, { status: 'stopping', connected: false });
+
+  const proc = pInfo.process;
+  let callbackCalled = false;
+
+  const doCallback = () => {
+    if (callbackCalled) return;
+    callbackCalled = true;
+    pInfo.status = 'stopped';
+    pInfo.process = null;
+    updateBotStatus(botId, { status: 'stopped', connected: false });
+    if (callback) callback();
+  };
+
+  // Listen for process exit
+  const onExit = () => {
+    proc.removeListener('exit', onExit);
+    doCallback();
+  };
+  proc.on('exit', onExit);
 
   // Send STOP message via IPC
   try {
-    pInfo.process.send({ type: 'STOP' });
+    proc.send({ type: 'STOP' });
   } catch (e) {
     // IPC failed, force kill
   }
 
-  // Force kill after timeout
-  setTimeout(() => {
-    const proc = pInfo.process;
-    if (proc && !proc.killed) {
+  // Force kill after timeout (3s for graceful, then SIGTERM/SIGKILL)
+  const gracefulTimeout = setTimeout(() => {
+    if (!proc.killed) {
+      console.log(`[BotManager] Force killing bot: ${botId}`);
       proc.kill('SIGTERM');
+
+      // Final fallback to SIGKILL after 5s
       setTimeout(() => {
-        if (proc && !proc.killed) {
+        if (!proc.killed) {
           proc.kill('SIGKILL');
         }
+        doCallback();
       }, 5000);
+    } else {
+      doCallback();
     }
-    if (callback) callback();
   }, 3000);
+
+  // Clear timeout if process exits early
+  proc.on('exit', () => {
+    clearTimeout(gracefulTimeout);
+  });
 
   return true;
 }
