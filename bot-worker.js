@@ -282,6 +282,18 @@ function createBot() {
     // Connection timeout
     clearBotTimeouts();
     connectionTimeoutId = setTimeout(() => {
+      // CRITICAL: Check stop flag before taking action
+      if (stopRequested) {
+        console.log(`[${botId}] Stop requested during connection - abandoning`);
+        try {
+          bot.removeAllListeners();
+          bot.end();
+        } catch (e) {}
+        bot = null;
+        botState.status = 'stopped';
+        return;
+      }
+
       if (!botState.connected) {
         console.log(`[${botId}] Connection timeout`);
         dispatchWebhookEvent('ErrorOccurred', {
@@ -423,7 +435,12 @@ function createBot() {
       error: err.message,
       playerCount: null
     });
-    scheduleReconnect('create_error');
+    // CRITICAL: Check stop flag before reconnecting
+    if (!stopRequested) {
+      scheduleReconnect('create_error');
+    } else {
+      botState.status = 'stopped';
+    }
   }
 }
 
@@ -473,6 +490,13 @@ function handlePlayerJoined(player) {
 }
 
 function scheduleReconnect(reason) {
+  // CRITICAL: Check stop flag FIRST before any reconnection logic
+  if (stopRequested) {
+    console.log(`[${botId}] Stop requested - aborting reconnect (${reason})`);
+    botState.status = 'stopped';
+    return;
+  }
+
   clearBotTimeouts();
 
   if (isReconnecting) {
@@ -496,26 +520,39 @@ function scheduleReconnect(reason) {
   reconnectTimeoutId = setTimeout(() => {
     reconnectTimeoutId = null;
     isReconnecting = false;
+    // Double-check stop flag before actually starting
+    if (stopRequested) {
+      console.log(`[${botId}] Stop requested during reconnect delay - aborting`);
+      botState.status = 'stopped';
+      return;
+    }
     startPlayerGuardPolling();
   }, delay);
 }
 
 function stopBot(callback) {
-  console.log(`[${botId}] Stopping bot...`);
+  console.log(`[${botId}] Stopping bot... (hard stop)`);
 
-  // Set stop flag to prevent reconnection
+  // Set stop flag FIRST to prevent any async callbacks from restarting
   stopRequested = true;
+  isReconnecting = false;
 
+  // Clear all timers/intervals immediately to stop any pending operations
   stopPlayerGuardPolling();
   clearBotTimeouts();
   clearAllIntervals();
 
+  // Update state
   botState.status = 'stopped';
   botState.connected = false;
+  botState.reconnectAttempts = 0;
 
+  // Destroy bot instance
   if (bot) {
     try {
+      // Remove ALL listeners first to prevent 'end' event from triggering reconnect
       bot.removeAllListeners();
+      // Force disconnect
       bot.end();
     } catch (e) {
       console.log(`[${botId}] Stop error: ${e.message}`);
@@ -787,6 +824,13 @@ process.on('uncaughtException', (err) => {
       clearTimeout(reconnectTimeoutId);
       reconnectTimeoutId = null;
     }
+  }
+
+  // CRITICAL: Check stopRequested before scheduling reconnect
+  if (stopRequested) {
+    console.log(`[${botId}] Stop requested - not scheduling reconnect after exception`);
+    botState.status = 'stopped';
+    return;
   }
 
   setTimeout(() => scheduleReconnect('crash'), 5000);
