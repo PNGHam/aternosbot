@@ -30,6 +30,7 @@ let playerGuardIntervalId = null;
 let occupiedNotificationSent = false;
 let disconnectedByPlayerDetection = false;
 let spawnHandled = false;
+let stopRequested = false; // Flag to prevent reconnection after stop
 
 // Discord rate limiting
 let lastWebhookSend = 0;
@@ -43,6 +44,8 @@ process.on('message', (msg) => {
 
   switch (msg.type) {
     case 'START':
+      // Reset stop flag when starting
+      stopRequested = false;
       startPlayerGuardPolling();
       break;
     case 'STOP':
@@ -55,6 +58,8 @@ process.on('message', (msg) => {
       Object.assign(botConfig, msg.config);
       if (msg.restart && botState.connected) {
         stopBot(() => {
+          // Reset stop flag before restart
+          stopRequested = false;
           setTimeout(() => startPlayerGuardPolling(), 2000);
         });
       }
@@ -144,6 +149,12 @@ function startPlayerGuardPolling() {
     return;
   }
 
+  // Check if stop was requested - don't restart
+  if (stopRequested) {
+    console.log(`[${botId}] Stop was requested - not starting player guard`);
+    return;
+  }
+
   isReconnecting = false;
   botState.status = 'polling';
   console.log(`[${botId}] Starting player guard polling...`);
@@ -151,8 +162,18 @@ function startPlayerGuardPolling() {
   const mc = require('minecraft-protocol');
 
   function checkAndJoin() {
-    if (!botConfig.playerGuard?.enabled) {
+    // Check stop flag before each iteration
+    if (stopRequested) {
+      console.log(`[${botId}] Stop requested - aborting player guard polling`);
       stopPlayerGuardPolling();
+      return;
+    }
+
+    // If player guard is disabled, join immediately
+    if (!botConfig.playerGuard?.enabled) {
+      console.log(`[${botId}] Player guard disabled - joining immediately`);
+      stopPlayerGuardPolling();
+      occupiedNotificationSent = false;
       createBot();
       return;
     }
@@ -160,6 +181,12 @@ function startPlayerGuardPolling() {
     mc.ping(
       { host: botConfig.serverIp, port: botConfig.serverPort },
       (err, response) => {
+        // Check stop flag after async ping
+        if (stopRequested) {
+          stopPlayerGuardPolling();
+          return;
+        }
+
         if (err) {
           console.log(`[${botId}] Ping error: ${err.message} - proceeding to join`);
           stopPlayerGuardPolling();
@@ -207,6 +234,12 @@ function stopPlayerGuardPolling() {
 // BOT CREATION AND LIFECYCLE
 // ============================================================
 function createBot() {
+  // Check if stop was requested
+  if (stopRequested) {
+    console.log(`[${botId}] Stop requested - not creating bot`);
+    return;
+  }
+
   if (isReconnecting) {
     console.log(`[${botId}] Already reconnecting, skipping`);
     return;
@@ -349,6 +382,13 @@ function createBot() {
         playerCount: botState.playerCount
       });
 
+      // Check if stop was requested - don't reconnect
+      if (stopRequested) {
+        console.log(`[${botId}] Stop was requested - not reconnecting`);
+        botState.status = 'stopped';
+        return;
+      }
+
       if (disconnectedByPlayerDetection) {
         disconnectedByPlayerDetection = false;
         occupiedNotificationSent = false;
@@ -462,6 +502,9 @@ function scheduleReconnect(reason) {
 
 function stopBot(callback) {
   console.log(`[${botId}] Stopping bot...`);
+
+  // Set stop flag to prevent reconnection
+  stopRequested = true;
 
   stopPlayerGuardPolling();
   clearBotTimeouts();
