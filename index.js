@@ -719,14 +719,11 @@ process.on('SIGINT', () => {
 });
 
 // ============================================================
-// AUTO-START ENABLED BOTS
+// NO AUTO-START ON LAUNCH
+// Bots must be manually started via the dashboard or API
+// The 'enabled' flag indicates the bot config is active/available,
+// NOT that it should auto-connect on app startup
 // ============================================================
-config.bots.forEach(botConfig => {
-  if (botConfig.enabled) {
-    console.log(`[AutoStart] Starting enabled bot: ${botConfig.name}`);
-    setTimeout(() => startBotInstance(botConfig.id), 1000);
-  }
-});
 
 // ============================================================
 // START SERVER
