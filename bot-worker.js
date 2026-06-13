@@ -300,6 +300,15 @@ function createBot() {
 
     // Spawn handler
     bot.once('spawn', () => {
+      // FIX: Check stopRequested immediately - spawn could fire after stop if race condition
+      if (stopRequested) {
+        console.log(`[${botId}] Spawn event received but stopRequested - discarding`);
+        try { bot.removeAllListeners(); bot.end(); } catch (e) {}
+        bot = null;
+        botState.status = 'stopped';
+        return;
+      }
+
       if (spawnHandled) return;
       spawnHandled = true;
 
@@ -316,7 +325,9 @@ function createBot() {
 
       if (botConfig.tryCreative) {
         setTimeout(() => {
-          if (bot && botState.connected) bot.chat('/gamemode spectator');
+          // FIX: Check stopRequested before sending command
+          if (stopRequested || !bot || !botState.connected) return;
+          bot.chat('/gamemode spectator');
         }, 10000);
       }
 
@@ -394,13 +405,13 @@ function createBot() {
 
     // Coords update
     bot.on('move', () => {
-      if (bot && bot.entity) {
-        botState.coordinates = {
-          x: Math.floor(bot.entity.position.x),
-          y: Math.floor(bot.entity.position.y),
-          z: Math.floor(bot.entity.position.z)
-        };
-      }
+      // FIX: Check stopRequested - though this is low impact, prevents state updates when stopped
+      if (stopRequested || !bot || !bot.entity) return;
+      botState.coordinates = {
+        x: Math.floor(bot.entity.position.x),
+        y: Math.floor(bot.entity.position.y),
+        z: Math.floor(bot.entity.position.z)
+      };
     });
 
   } catch (err) {
@@ -415,7 +426,8 @@ function createBot() {
 }
 
 function checkExistingPlayers() {
-  if (!bot || !botState.connected) return;
+  // FIX: Check stopRequested before processing players
+  if (stopRequested || !bot || !botState.connected) return;
 
   const existingPlayers = Object.values(bot.players).filter(p => p.username !== bot.username);
   if (existingPlayers.length > 0) {
@@ -429,6 +441,7 @@ function checkExistingPlayers() {
     });
 
     if (botConfig.playerGuard?.evictOnPlayer) {
+      console.log(`[${botId}] Evicting due to players at spawn`);
       disconnectedByPlayerDetection = true;
       botState.connected = false;
       clearAllIntervals();
@@ -532,7 +545,8 @@ function stopBot(callback) {
 // MODULE INITIALIZATION
 // ============================================================
 function initializeModules() {
-  if (!bot || !botState.connected) return;
+  // FIX: Check stopRequested before initializing modules
+  if (stopRequested || !bot || !botState.connected) return;
 
   console.log(`[${botId}] Initializing modules`);
 
@@ -582,14 +596,16 @@ function initializeAutoAuth(password) {
   let authHandled = false;
 
   const tryAuth = (type) => {
-    if (authHandled || !bot || !botState.connected) return;
+    // FIX: Check stopRequested before any auth action
+    if (stopRequested || authHandled || !bot || !botState.connected) return;
     authHandled = true;
     bot.chat(type === 'register' ? `/register ${password} ${password}` : `/login ${password}`);
     console.log(`[${botId}] Auto-auth: ${type}`);
   };
 
   bot.on('messagestr', (message) => {
-    if (authHandled) return;
+    // FIX: Check stopRequested in message handler
+    if (stopRequested || authHandled) return;
     const msg = message.toLowerCase();
     if (msg.includes('/register') || msg.includes('register')) {
       tryAuth('register');
@@ -599,10 +615,10 @@ function initializeAutoAuth(password) {
   });
 
   setTimeout(() => {
-    if (!authHandled && bot && botState.connected) {
-      bot.chat(`/login ${password}`);
-      authHandled = true;
-    }
+    // FIX: Check stopRequested before auto-login
+    if (stopRequested || authHandled || !bot || !botState.connected) return;
+    bot.chat(`/login ${password}`);
+    authHandled = true;
   }, 3000);
 }
 
@@ -707,7 +723,8 @@ function initializeCombat() {
 
   if (botConfig.combat.attackMobs) {
     bot.on('physicsTick', () => {
-      if (!bot || !botState.connected) return;
+      // FIX: Check stopRequested before attack logic
+      if (stopRequested || !bot || !botState.connected) return;
 
       const now = Date.now();
       if (now - lastAttackTime < 620) return;
@@ -741,6 +758,8 @@ function initializeCombat() {
 
   if (botConfig.combat.autoEat) {
     bot.on('health', () => {
+      // FIX: Check stopRequested before eating
+      if (stopRequested || !bot || !botState.connected) return;
       try {
         if (bot.food < 14) {
           const food = bot.inventory.items().find(i => i.foodPoints && i.foodPoints > 0);
