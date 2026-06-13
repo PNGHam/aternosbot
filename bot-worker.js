@@ -1,814 +1,303 @@
+
 'use strict';
 
 const mineflayer = require('mineflayer');
-const { Movements, pathfinder, goals } = require('mineflayer-pathfinder');
+const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 const { GoalBlock } = goals;
-
-// Bot configuration passed via environment variables (JSON stringified)
-const botConfig = JSON.parse(process.env.BOT_CONFIG || '{}');
-const botId = botConfig.id || 'unknown';
-
-// State tracking
-let bot = null;
-let botState = {
-  connected: false,
-  playerCount: 0,
-  lastActivity: Date.now(),
-  reconnectAttempts: 0,
-  startTime: Date.now(),
-  coordinates: null,
-  status: 'idle',
-  errors: []
-};
-
-// Intervals and timeouts
-let activeIntervals = [];
-let reconnectTimeoutId = null;
-let connectionTimeoutId = null;
-let isReconnecting = false;
-let playerGuardIntervalId = null;
-let occupiedNotificationSent = false;
-let disconnectedByPlayerDetection = false;
-let spawnHandled = false;
-let stopRequested = false;
-let statusIntervalId = null;
-
-// Discord rate limiting
-let lastWebhookSend = 0;
-const WEBHOOK_RATE_LIMIT_MS = 5000;
+const mcProtocol = require('minecraft-protocol');
 
 // ============================================================
-// IPC MESSAGE HANDLING
+// CONFIGURATION & STATE
+// ============================================================
+const config = JSON.parse(process.env.BOT_CONFIG || '{}');
+const botId = config.id || 'unknown';
+
+// Single Source of Truth for operation
+let isRunning = false;
+
+// Resources
+let bot = null;
+let intervals = []; // Stores all interval IDs
+let timeouts = [];  // Stores all timeout IDs
+
+// ============================================================
+// IPC HANDLERS (The Control Interface)
 // ============================================================
 process.on('message', (msg) => {
-  if (!msg || !msg.type) return;
+  if (!msg) return;
 
   switch (msg.type) {
     case 'START':
-      stopRequested = false;
-      startPlayerGuardPolling();
+      cmdStart();
       break;
     case 'STOP':
-      stopBot();
-      break;
-    case 'GET_STATUS':
-      sendStatus();
+      cmdStop();
       break;
     case 'UPDATE_CONFIG':
-      Object.assign(botConfig, msg.config);
-      if (msg.restart && botState.connected) {
-        stopBot(() => {
-          stopRequested = false;
-          setTimeout(() => startPlayerGuardPolling(), 2000);
-        });
-      }
+      Object.assign(config, msg.config);
+      // If running, we assume the user might want a restart, 
+      // but strict state control implies we just update config for next run
+      // or active modules. We won't force reconnect here to keep logic clean.
       break;
-    default:
-      console.log(`[${botId}] Unknown IPC message type: ${msg.type}`);
   }
 });
 
-function sendStatus() {
-  process.send({
-    type: 'STATUS_UPDATE',
-    botId: botId,
-    status: {
-      connected: botState.connected,
-      playerCount: botState.playerCount,
-      status: botState.status,
-      lastActivity: botState.lastActivity,
-      reconnectAttempts: botState.reconnectAttempts,
-      uptime: Math.floor((Date.now() - botState.startTime) / 1000),
-      coordinates: botState.coordinates,
-      errors: botState.errors.slice(-10)
-    }
-  });
-}
-
-function dispatchWebhookEvent(eventType, additionalData = {}) {
-  const payload = {
-    eventType,
-    timestamp: new Date().toISOString(),
-    serverIP: `${botConfig.serverIp}:${botConfig.serverPort}`,
-    botName: botConfig.name,
-    ...additionalData
-  };
-
-  process.send({
-    type: 'WEBHOOK_EVENT',
-    botId: botId,
-    payload
-  });
-}
-
-// ============================================================
-// STOP-STATE GUARD
-// Returns true and logs a warning if the bot is stopped.
-// Use this at the top of any function that must not run while stopped.
-// ============================================================
-function isStopped(context) {
-  if (stopRequested) {
-    console.log(`[${botId}] Skipping ${context} — bot is stopped`);
-    return true;
-  }
-  return false;
-}
-
-// ============================================================
-// HELPER FUNCTIONS
-// ============================================================
-function clearBotTimeouts() {
-  if (reconnectTimeoutId) {
-    clearTimeout(reconnectTimeoutId);
-    reconnectTimeoutId = null;
-  }
-  if (connectionTimeoutId) {
-    clearTimeout(connectionTimeoutId);
-    connectionTimeoutId = null;
-  }
-}
-
-function clearAllIntervals() {
-  activeIntervals.forEach(id => clearInterval(id));
-  activeIntervals = [];
-  if (statusIntervalId) {
-    clearInterval(statusIntervalId);
-    statusIntervalId = null;
-  }
-}
-
-function addInterval(callback, delay) {
-  const id = setInterval(callback, delay);
-  activeIntervals.push(id);
-  return id;
-}
-
-function getReconnectDelay() {
-  const baseDelay = botConfig.autoReconnectDelay || botConfig.autoReconnect?.delay || 3000;
-  const maxDelay = botConfig.maxReconnectDelay || 30000;
-  const attempts = botState.reconnectAttempts;
-
-  const delay = Math.min(baseDelay * Math.pow(2, attempts), maxDelay);
-  const jitter = Math.floor(Math.random() * 2000);
-  return delay + jitter;
-}
-
-// ============================================================
-// PLAYER GUARD - Pre-join polling
-// ============================================================
-const PLAYER_GUARD_POLL_INTERVAL = botConfig.playerGuard?.pollInterval || 30000;
-
-function startPlayerGuardPolling() {
-  if (isStopped('startPlayerGuardPolling')) return;
-
-  if (playerGuardIntervalId) {
-    console.log(`[${botId}] Player guard polling already active`);
+function cmdStart() {
+  if (isRunning) {
+    console.log(`[${botId}] Start ignored: Already running`);
     return;
   }
 
-  isReconnecting = false;
-  botState.status = 'polling';
-  console.log(`[${botId}] Starting player guard polling`);
-
-  const mc = require('minecraft-protocol');
-
-  function checkAndJoin() {
-    if (isStopped('checkAndJoin')) {
-      stopPlayerGuardPolling();
-      return;
-    }
-
-    if (!botConfig.playerGuard?.enabled) {
-      stopPlayerGuardPolling();
-      occupiedNotificationSent = false;
-      createBot();
-      return;
-    }
-
-    mc.ping(
-      { host: botConfig.serverIp, port: botConfig.serverPort },
-      (err, response) => {
-        if (isStopped('ping callback')) {
-          stopPlayerGuardPolling();
-          return;
-        }
-
-        if (err) {
-          console.log(`[${botId}] Ping failed — proceeding to connect`);
-          stopPlayerGuardPolling();
-          occupiedNotificationSent = false;
-          createBot();
-          return;
-        }
-
-        const onlinePlayers = response?.players?.online || 0;
-        botState.playerCount = onlinePlayers;
-
-        if (onlinePlayers === 0) {
-          console.log(`[${botId}] Server is empty — joining`);
-          stopPlayerGuardPolling();
-          occupiedNotificationSent = false;
-          createBot();
-        } else {
-          if (!occupiedNotificationSent) {
-            console.log(`[${botId}] Server occupied (${onlinePlayers} player(s)) — waiting`);
-            occupiedNotificationSent = true;
-            dispatchWebhookEvent('PlayerOnServer', {
-              playerCount: onlinePlayers,
-              message: `Server occupied with ${onlinePlayers} player(s). Bot waiting.`
-            });
-          }
-        }
-      }
-    );
-  }
-
-  checkAndJoin();
-  playerGuardIntervalId = setInterval(checkAndJoin, PLAYER_GUARD_POLL_INTERVAL);
+  console.log(`[${botId}] Received START command`);
+  isRunning = true;
+  runEntrySequence();
 }
 
-function stopPlayerGuardPolling() {
-  if (playerGuardIntervalId) {
-    clearInterval(playerGuardIntervalId);
-    playerGuardIntervalId = null;
-    console.log(`[${botId}] Player guard polling stopped`);
-  }
-}
-
-// ============================================================
-// BOT CREATION AND LIFECYCLE
-// ============================================================
-function createBot() {
-  if (isStopped('createBot')) return;
-
-  if (isReconnecting) {
-    console.log(`[${botId}] Already reconnecting — skipping createBot`);
+function cmdStop() {
+  if (!isRunning) {
+    console.log(`[${botId}] Stop ignored: Already stopped`);
     return;
   }
 
-  // Cleanup previous instance
+  console.log(`[${botId}] Received STOP command`);
+  
+  // 1. Set flag immediately. This gates all subsequent logic.
+  isRunning = false;
+
+  // 2. Clean up resources
+  performHardStop();
+}
+
+// ============================================================
+// LIFECYCLE MANAGEMENT
+// ============================================================
+
+function runEntrySequence() {
+  // Gatekeeper: If stopped before we could run, abort.
+  if (!isRunning) return;
+
+  // Cleanup previous artifacts just in case
+  performHardStop();
+
+  if (config.playerGuard?.enabled) {
+    startPlayerGuard();
+  } else {
+    connectToServer();
+  }
+}
+
+function performHardStop() {
+  // Clear all timers
+  intervals.forEach(clearInterval);
+  timeouts.forEach(clearTimeout);
+  intervals = [];
+  timeouts = [];
+
+  // Kill bot instance
   if (bot) {
-    clearAllIntervals();
     try {
+      // Remove listeners to prevent 'end' or 'error' from triggering logic
       bot.removeAllListeners();
       bot.end();
-    } catch (e) {}
+    } catch (err) {
+      // Ignore cleanup errors
+    }
     bot = null;
   }
 
-  console.log(`[${botId}] Connecting to ${botConfig.serverIp}:${botConfig.serverPort}`);
-  botState.status = 'connecting';
-  spawnHandled = false;
+  sendStatusUpdate('stopped');
+}
+
+// ============================================================
+// PLAYER GUARD (Pre-connection logic)
+// ============================================================
+function startPlayerGuard() {
+  console.log(`[${botId}] Starting Player Guard`);
+
+  const doPoll = () => {
+    if (!isRunning) return;
+
+    mcProtocol.ping({ host: config.serverIp, port: config.serverPort }, (err, response) => {
+      if (!isRunning) return;
+
+      if (err) {
+        console.log(`[${botId}] Ping failed (server offline/blocking), connecting anyway.`);
+        connectToServer();
+        return;
+      }
+
+      const players = response?.players?.online || 0;
+      sendStatusUpdate('polling', { playerCount: players });
+
+      if (players === 0) {
+        console.log(`[${botId}] Server empty. Connecting.`);
+        connectToServer();
+      } else {
+        console.log(`[${botId}] Server occupied (${players}). Waiting...`);
+        // Schedule next poll
+        scheduleNextPoll();
+      }
+    });
+  };
+
+  doPoll();
+}
+
+function scheduleNextPoll() {
+  if (!isRunning) return;
+  const id = setTimeout(() => {
+    // Remove self from timeout tracker after execution
+    timeouts = timeouts.filter(t => t !== id); 
+    startPlayerGuard(); // Re-run the check
+  }, config.playerGuard?.pollInterval || 30000);
+  timeouts.push(id);
+}
+
+// ============================================================
+// CONNECTION LOGIC
+// ============================================================
+function connectToServer() {
+  if (!isRunning) return;
+
+  console.log(`[${botId}] Connecting to ${config.serverIp}:${config.serverPort}...`);
+  sendStatusUpdate('connecting');
 
   try {
-    const botVersion = botConfig.serverVersion?.trim() || false;
-
     bot = mineflayer.createBot({
-      username: botConfig.name,
-      password: botConfig.password || undefined,
-      auth: botConfig.authType || 'offline',
-      host: botConfig.serverIp,
-      port: botConfig.serverPort,
-      version: botVersion,
-      hideErrors: false,
-      checkTimeoutInterval: 600000
+      host: config.serverIp,
+      port: config.serverPort || 25565,
+      username: config.name,
+      password: config.password,
+      auth: config.authType || 'offline',
+      version: config.serverVersion || false
     });
 
     bot.loadPlugin(pathfinder);
 
-    // Connection timeout
-    clearBotTimeouts();
-    connectionTimeoutId = setTimeout(() => {
-      if (isStopped('connection timeout')) {
-        try { bot.removeAllListeners(); bot.end(); } catch (e) {}
-        bot = null;
-        botState.status = 'stopped';
-        return;
-      }
-
-      if (!botState.connected) {
-        console.log(`[${botId}] Connection timed out — no spawn received`);
-        dispatchWebhookEvent('ErrorOccurred', {
-          error: 'Connection timeout - no spawn received',
-          playerCount: null
-        });
-        try { bot.removeAllListeners(); bot.end(); } catch (e) {}
-        bot = null;
-        scheduleReconnect('timeout');
-      }
-    }, 150000);
-
-    // Spawn handler
+    // Handle Success
     bot.once('spawn', () => {
-      // FIX: Check stopRequested immediately - spawn could fire after stop if race condition
-      if (stopRequested) {
-        console.log(`[${botId}] Spawn event received but stopRequested - discarding`);
-        try { bot.removeAllListeners(); bot.end(); } catch (e) {}
-        bot = null;
-        botState.status = 'stopped';
+      if (!isRunning) {
+        // Race condition: Stop clicked while connecting.
+        performHardStop();
         return;
       }
-
-      if (spawnHandled) return;
-      spawnHandled = true;
-
-      clearBotTimeouts();
-      botState.connected = true;
-      botState.status = 'connected';
-      botState.lastActivity = Date.now();
-      botState.reconnectAttempts = 0;
-      botState.startTime = Date.now();
-      isReconnecting = false;
-
-      console.log(`[${botId}] Spawned successfully (version: ${bot.version})`);
-      dispatchWebhookEvent('BotSpawned', { playerCount: 0, version: bot.version });
-
-      if (botConfig.tryCreative) {
-        setTimeout(() => {
-          // FIX: Check stopRequested before sending command
-          if (stopRequested || !bot || !botState.connected) return;
-          bot.chat('/gamemode spectator');
-        }, 10000);
-      }
-
-      initializeModules();
-      checkExistingPlayers();
-
-      bot.on('playerJoined', (player) => handlePlayerJoined(player));
+      
+      console.log(`[${botId}] Spawned successfully.`);
+      onSpawn();
     });
 
-    // Kicked handler
+    // Handle Disconnection
+    bot.on('end', () => {
+      console.log(`[${botId}] Connection ended.`);
+      
+      // Only reconnect if we are still supposed to be running
+      if (isRunning) {
+        scheduleReconnect();
+      } else {
+        performHardStop();
+      }
+    });
+
+    // Handle Kick
     bot.on('kicked', (reason) => {
-      if (isStopped('kicked event')) return;
-
-      const kickReason = typeof reason === 'object' ? JSON.stringify(reason) : String(reason);
-      console.log(`[${botId}] Kicked: ${kickReason}`);
-
-      botState.connected = false;
-      botState.status = 'kicked';
-      botState.errors.push({ type: 'kicked', reason: kickReason, time: Date.now() });
-      clearAllIntervals();
-
-      const reasonStr = kickReason.toLowerCase();
-      const isFull = reasonStr.includes('full') || reasonStr.includes('capacity');
-      const isAuthFail = reasonStr.includes('auth') || reasonStr.includes('login') || reasonStr.includes('password');
-      const isThrottle = reasonStr.includes('throttl') || reasonStr.includes('wait before') || reasonStr.includes('too fast');
-
-      if (isFull) {
-        dispatchWebhookEvent('ServerFull', { playerCount: null });
-      } else if (isAuthFail) {
-        dispatchWebhookEvent('AuthFailed', { playerCount: null });
-      } else {
-        dispatchWebhookEvent('BotKicked', { reason: kickReason, playerCount: null });
-      }
-
-      if (isThrottle) {
-        botState.reconnectAttempts += 2;
-      }
+      console.log(`[${botId}] Kicked: ${reason}`);
+      // If kicked, we treat it as an 'end' event for reconnection purposes
+      // The 'end' event will fire next, triggering the logic above.
     });
 
-    // End handler
-    bot.on('end', (reason) => {
-      if (isStopped('end event')) {
-        botState.connected = false;
-        botState.status = 'stopped';
-        return;
-      }
-
-      console.log(`[${botId}] Disconnected: ${reason || 'Unknown'}`);
-      botState.connected = false;
-      botState.status = 'disconnected';
-      clearAllIntervals();
-      spawnHandled = false;
-
-      dispatchWebhookEvent('Disconnected', {
-        reason: reason || 'Unknown',
-        playerCount: botState.playerCount
-      });
-
-      if (disconnectedByPlayerDetection) {
-        disconnectedByPlayerDetection = false;
-        occupiedNotificationSent = false;
-        isReconnecting = false;
-        startPlayerGuardPolling();
-      } else {
-        scheduleReconnect('end');
-      }
-    });
-
-    // Error handler
+    // Handle Errors
     bot.on('error', (err) => {
-      if (isStopped('error event')) return;
-      console.log(`[${botId}] Bot error: ${err.message}`);
-      botState.errors.push({ type: 'error', message: err.message, time: Date.now() });
-    });
-
-    // Coords update
-    bot.on('move', () => {
-      // FIX: Check stopRequested - though this is low impact, prevents state updates when stopped
-      if (stopRequested || !bot || !bot.entity) return;
-      botState.coordinates = {
-        x: Math.floor(bot.entity.position.x),
-        y: Math.floor(bot.entity.position.y),
-        z: Math.floor(bot.entity.position.z)
-      };
+      console.error(`[${botId}] Bot Error: ${err.message}`);
+      // Errors often precede 'end'. We let 'end' handle the reconnection logic.
     });
 
   } catch (err) {
-    console.log(`[${botId}] Failed to create bot: ${err.message}`);
-    dispatchWebhookEvent('ErrorOccurred', { error: err.message, playerCount: null });
-    if (!stopRequested) {
-      scheduleReconnect('create_error');
-    } else {
-      botState.status = 'stopped';
-    }
+    console.error(`[${botId}] Critical connection error: ${err.message}`);
+    if (isRunning) scheduleReconnect();
   }
 }
 
-function checkExistingPlayers() {
-  // FIX: Check stopRequested before processing players
-  if (stopRequested || !bot || !botState.connected) return;
+function scheduleReconnect() {
+  if (!isRunning) return;
 
-  const existingPlayers = Object.values(bot.players).filter(p => p.username !== bot.username);
-  if (existingPlayers.length > 0) {
-    const names = existingPlayers.map(p => p.username).join(', ');
-    console.log(`[${botId}] Players already online at spawn: ${names}`);
+  const delay = 5000; // Simple fixed delay for robustness, can be exponential
+  console.log(`[${botId}] Reconnecting in ${delay / 1000}s...`);
+  sendStatusUpdate('reconnecting');
 
-    dispatchWebhookEvent('PlayerOnServer', {
-      playerCount: existingPlayers.length,
-      playerNames: existingPlayers.map(p => p.username),
-      message: `Players detected at spawn: ${names}`
-    });
-
-    if (botConfig.playerGuard?.evictOnPlayer) {
-      console.log(`[${botId}] Evicting due to players at spawn`);
-      disconnectedByPlayerDetection = true;
-      botState.connected = false;
-      clearAllIntervals();
-      try { bot.end(); } catch (e) {}
-    }
-  }
-}
-
-function handlePlayerJoined(player) {
-  if (isStopped('handlePlayerJoined')) return;
-  if (!botState.connected || player.username === bot.username) return;
-
-  botState.playerCount = Object.values(bot.players).filter(p => p.username !== bot.username).length;
-  console.log(`[${botId}] Player joined: ${player.username} (${botState.playerCount} on server)`);
-
-  dispatchWebhookEvent('PlayerOnServer', {
-    playerCount: botState.playerCount,
-    playerName: player.username,
-    message: `Player ${player.username} joined the server`
-  });
-
-  if (botConfig.playerGuard?.evictOnPlayer) {
-    disconnectedByPlayerDetection = true;
-    botState.connected = false;
-    clearAllIntervals();
-    try { bot.end(); } catch (e) {}
-  }
-}
-
-function scheduleReconnect(reason) {
-  if (isStopped('scheduleReconnect')) {
-    botState.status = 'stopped';
-    return;
-  }
-
-  clearBotTimeouts();
-
-  if (isReconnecting) return;
-
-  isReconnecting = true;
-  botState.reconnectAttempts++;
-  botState.status = 'reconnecting';
-
-  const delay = getReconnectDelay();
-  console.log(`[${botId}] Reconnecting in ${Math.round(delay / 1000)}s (attempt #${botState.reconnectAttempts}, reason: ${reason})`);
-
-  dispatchWebhookEvent('BotReconnecting', {
-    attempt: botState.reconnectAttempts,
-    delay: delay,
-    playerCount: null
-  });
-
-  reconnectTimeoutId = setTimeout(() => {
-    reconnectTimeoutId = null;
-    isReconnecting = false;
-    if (isStopped('reconnect timer')) {
-      botState.status = 'stopped';
-      return;
-    }
-    startPlayerGuardPolling();
+  const id = setTimeout(() => {
+    timeouts = timeouts.filter(t => t !== id);
+    connectToServer();
   }, delay);
-}
-
-function stopBot(callback) {
-  console.log(`[${botId}] Stopping bot`);
-
-  // Set stop flag first to gate all async callbacks
-  stopRequested = true;
-  isReconnecting = false;
-
-  // Cancel all pending timers and intervals immediately
-  stopPlayerGuardPolling();
-  clearBotTimeouts();
-  clearAllIntervals();
-
-  botState.status = 'stopped';
-  botState.connected = false;
-  botState.reconnectAttempts = 0;
-
-  // Destroy bot instance — remove listeners before end() to prevent
-  // the 'end' event from triggering reconnection logic
-  if (bot) {
-    try {
-      bot.removeAllListeners();
-      bot.end();
-    } catch (e) {
-      console.log(`[${botId}] Error during bot teardown: ${e.message}`);
-    }
-    bot = null;
-  }
-
-  if (callback) callback();
-
-  process.send({ type: 'BOT_STOPPED', botId: botId });
-
-  console.log(`[${botId}] Bot stopped — worker exiting`);
-  setTimeout(() => process.exit(0), 500);
+  
+  timeouts.push(id);
 }
 
 // ============================================================
-// MODULE INITIALIZATION
+// IN-GAME LOGIC (Modules)
 // ============================================================
-function initializeModules() {
-  // FIX: Check stopRequested before initializing modules
-  if (stopRequested || !bot || !botState.connected) return;
+function onSpawn() {
+  sendStatusUpdate('online');
+  
+  // Setup modules
+  setupAntiAfk();
+  setupMovement();
+  
+  // Notify Master
+  process.send({ type: 'WEBHOOK_EVENT', botId, payload: { eventType: 'Connected', message: 'Bot connected successfully' } });
+}
 
-  console.log(`[${botId}] Initializing modules`);
+function setupAntiAfk() {
+  if (!config.antiAfk?.enabled) return;
+
+  const intervalId = setInterval(() => {
+    if (!isRunning || !bot) return;
+    
+    if (config.antiAfk.swingArm) bot.swingArm();
+    if (config.antiAfk.sneak) bot.setControlState('sneak', true);
+  }, 10000);
+  
+  intervals.push(intervalId);
+}
+
+function setupMovement() {
+  if (!config.movement?.enabled || !bot) return;
 
   const mcData = require('minecraft-data')(bot.version);
   const defaultMove = new Movements(bot, mcData);
-  defaultMove.allowFreeMotion = false;
-  defaultMove.canDig = false;
-
   bot.pathfinder.setMovements(defaultMove);
 
-  if (botConfig.autoAuth?.enabled && botConfig.autoAuth?.password) {
-    initializeAutoAuth(botConfig.autoAuth.password);
-  }
-
-  if (botConfig.antiAfk?.enabled) {
-    initializeAntiAfk();
-  }
-
-  if (botConfig.movement?.enabled !== false) {
-    if (botConfig.movement?.circleWalk?.enabled) {
-      initializeCircleWalk(defaultMove);
-    }
-    if (botConfig.movement?.randomJump?.enabled && !botConfig.movement?.circleWalk?.enabled) {
-      initializeRandomJump();
-    }
-    if (botConfig.movement?.lookAround?.enabled) {
-      initializeLookAround();
-    }
-  }
-
-  if (botConfig.position?.enabled && !botConfig.movement?.circleWalk?.enabled) {
-    bot.pathfinder.setGoal(new GoalBlock(
-      botConfig.position.x,
-      botConfig.position.y,
-      botConfig.position.z
-    ));
-  }
-
-  if (botConfig.combat?.attackMobs || botConfig.combat?.autoEat) {
-    initializeCombat();
-  }
-
-  console.log(`[${botId}] Modules initialized`);
-}
-
-function initializeAutoAuth(password) {
-  let authHandled = false;
-
-  const tryAuth = (type) => {
-    // FIX: Check stopRequested before any auth action
-    if (stopRequested || authHandled || !bot || !botState.connected) return;
-    authHandled = true;
-    bot.chat(type === 'register' ? `/register ${password} ${password}` : `/login ${password}`);
-    console.log(`[${botId}] Auto-auth: ${type}`);
-  };
-
-  bot.on('messagestr', (message) => {
-    // FIX: Check stopRequested in message handler
-    if (stopRequested || authHandled) return;
-    const msg = message.toLowerCase();
-    if (msg.includes('/register') || msg.includes('register')) {
-      tryAuth('register');
-    } else if (msg.includes('/login') || msg.includes('login')) {
-      tryAuth('login');
-    }
-  });
-
-  setTimeout(() => {
-    // FIX: Check stopRequested before auto-login
-    if (stopRequested || authHandled || !bot || !botState.connected) return;
-    bot.chat(`/login ${password}`);
-    authHandled = true;
-  }, 3000);
-}
-
-function initializeAntiAfk() {
-  console.log(`[${botId}] Anti-AFK module active`);
-
-  if (botConfig.antiAfk.swingArm) {
-    addInterval(() => {
-      if (stopRequested || !bot || !botState.connected) return;
-      try { bot.swingArm(); } catch (e) {}
-    }, 10000 + Math.floor(Math.random() * 50000));
-  }
-
-  if (botConfig.antiAfk.hotbarCycle) {
-    addInterval(() => {
-      if (stopRequested || !bot || !botState.connected) return;
-      try {
-        bot.setQuickBarSlot(Math.floor(Math.random() * 9));
-      } catch (e) {}
-    }, 30000 + Math.floor(Math.random() * 90000));
-  }
-
-  if (botConfig.antiAfk.sneak) {
-    try { bot.setControlState('sneak', true); } catch (e) {}
-  }
-
-  if (!botConfig.movement?.circleWalk?.enabled) {
-    addInterval(() => {
-      if (stopRequested || !bot || !botState.connected) return;
-      try {
-        bot.look(Math.random() * Math.PI * 2, 0, true);
-        bot.setControlState('forward', true);
-        setTimeout(() => {
-          if (stopRequested || !bot) return;
-          bot.setControlState('forward', false);
-        }, 500 + Math.floor(Math.random() * 1500));
-        botState.lastActivity = Date.now();
-      } catch (e) {}
-    }, 120000 + Math.floor(Math.random() * 360000));
-  }
-}
-
-function initializeCircleWalk(defaultMove) {
-  console.log(`[${botId}] Circle walk module active`);
-  const radius = botConfig.movement.circleWalk.radius || 5;
-  const speed = botConfig.movement.circleWalk.speed || 3000;
-  let angle = 0;
-  let lastPathTime = 0;
-
-  addInterval(() => {
-    if (stopRequested || !bot || !botState.connected) return;
-    const now = Date.now();
-    if (now - lastPathTime < 2000) return;
-    lastPathTime = now;
-
-    try {
+  if (config.movement.circleWalk?.enabled) {
+    let angle = 0;
+    const radius = config.movement.circleWalk.radius || 5;
+    
+    const walkInterval = setInterval(() => {
+      if (!isRunning || !bot) return;
+      
       const x = bot.entity.position.x + Math.cos(angle) * radius;
       const z = bot.entity.position.z + Math.sin(angle) * radius;
+      
       bot.pathfinder.setGoal(new GoalBlock(Math.floor(x), Math.floor(bot.entity.position.y), Math.floor(z)));
       angle += Math.PI / 4;
-      botState.lastActivity = Date.now();
-    } catch (e) {}
-  }, speed);
-}
+    }, 3000);
 
-function initializeRandomJump() {
-  console.log(`[${botId}] Random jump module active`);
-  const interval = botConfig.movement.randomJump.interval || 15000;
-
-  addInterval(() => {
-    if (stopRequested || !bot || !botState.connected) return;
-    try {
-      bot.setControlState('jump', true);
-      setTimeout(() => {
-        if (stopRequested || !bot) return;
-        bot.setControlState('jump', false);
-      }, 300);
-      botState.lastActivity = Date.now();
-    } catch (e) {}
-  }, interval);
-}
-
-function initializeLookAround() {
-  console.log(`[${botId}] Look around module active`);
-  const interval = botConfig.movement.lookAround.interval || 20000;
-
-  addInterval(() => {
-    if (stopRequested || !bot || !botState.connected) return;
-    try {
-      const yaw = (Math.random() * Math.PI * 2) - Math.PI;
-      const pitch = (Math.random() * Math.PI / 2) - Math.PI / 4;
-      bot.look(yaw, pitch, false);
-      botState.lastActivity = Date.now();
-    } catch (e) {}
-  }, interval);
-}
-
-function initializeCombat() {
-  let lastAttackTime = 0;
-  let lockedTarget = null;
-  let lockedTargetExpiry = 0;
-
-  if (botConfig.combat.attackMobs) {
-    bot.on('physicsTick', () => {
-      // FIX: Check stopRequested before attack logic
-      if (stopRequested || !bot || !botState.connected) return;
-
-      const now = Date.now();
-      if (now - lastAttackTime < 620) return;
-
-      try {
-        if (lockedTarget && now < lockedTargetExpiry && bot.entities[lockedTarget.id]) {
-          const dist = bot.entity.position.distanceTo(lockedTarget.position);
-          if (dist < 4) {
-            bot.attack(lockedTarget);
-            lastAttackTime = now;
-            return;
-          } else {
-            lockedTarget = null;
-          }
-        }
-
-        const mobs = Object.values(bot.entities).filter(e =>
-          e.type === 'mob' && e.position &&
-          bot.entity.position.distanceTo(e.position) < 4
-        );
-
-        if (mobs.length > 0) {
-          lockedTarget = mobs[0];
-          lockedTargetExpiry = now + 3000;
-          bot.attack(lockedTarget);
-          lastAttackTime = now;
-        }
-      } catch (e) {}
-    });
-  }
-
-  if (botConfig.combat.autoEat) {
-    bot.on('health', () => {
-      // FIX: Check stopRequested before eating
-      if (stopRequested || !bot || !botState.connected) return;
-      try {
-        if (bot.food < 14) {
-          const food = bot.inventory.items().find(i => i.foodPoints && i.foodPoints > 0);
-          if (food) {
-            bot.equip(food, 'hand')
-              .then(() => bot.consume())
-              .catch(() => {});
-          }
-        }
-      } catch (e) {}
-    });
+    intervals.push(walkInterval);
   }
 }
 
 // ============================================================
-// ERROR HANDLING
+// UTILITIES
 // ============================================================
-process.on('uncaughtException', (err) => {
-  console.log(`[${botId}] Uncaught exception: ${err.message}`);
-  botState.errors.push({ type: 'uncaught', message: err.message, time: Date.now() });
+function sendStatusUpdate(status, extra = {}) {
+  process.send({
+    type: 'STATUS_UPDATE',
+    botId: botId,
+    status: {
+      status: status,
+      connected: status === 'online',
+      ...extra
+    }
+  });
+}
 
-  if (botState.errors.length > 100) {
-    botState.errors = botState.errors.slice(-50);
-  }
-
-  clearAllIntervals();
-  botState.connected = false;
-
-  if (isReconnecting) {
-    isReconnecting = false;
-    clearBotTimeouts();
-  }
-
-  if (stopRequested) {
-    botState.status = 'stopped';
-    return;
-  }
-
-  botState.status = 'error';
-  // Uncaught exceptions are usually fatal — do not auto-reconnect
-});
-
-process.on('unhandledRejection', (reason) => {
-  console.log(`[${botId}] Unhandled rejection: ${reason}`);
-  botState.errors.push({ type: 'rejection', message: String(reason), time: Date.now() });
-});
-
-// Status heartbeat
-statusIntervalId = setInterval(sendStatus, 3000);
-
-// Notify parent that worker is ready
-process.send({ type: 'WORKER_READY', botId: botId });
+// Notify parent we are ready to accept commands
+process.send({ type: 'WORKER_READY', botId });
