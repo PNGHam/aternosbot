@@ -536,29 +536,86 @@ function initializeModules() {
   console.log(`[${botId}] Modules initialized`);
 }
 
-// ─── Auto-auth ───────────────────────────────────────────────
+/**
+ * Auto Auth — Fixed
+ *
+ * Bugs fixed:
+ * 1. Listens on both 'message' and 'messagestr' events so prompts
+ *    sent via chat or system messages are both caught.
+ * 2. Tracks whether the server asked for /register specifically,
+ *    so we never send /login when /register is required.
+ * 3. Added a secondary delayed attempt in case the prompt was
+ *    sent before the listener was attached (race condition on spawn).
+ * 4. Guarded every callback with isRunning and botState.connected.
+ */
 function initAutoAuth(password) {
-  let done = false;
+  if (!password) {
+    console.log(`[${botId}] Auto-auth: no password configured — skipping`);
+    return;
+  }
 
-  const tryAuth = type => {
-    if (!isRunning || done || !botState.connected) return;
-    done = true;
-    try { bot.chat(type === 'register' ? `/register ${password} ${password}` : `/login ${password}`); } catch (_) {}
-    console.log(`[${botId}] Auto-auth: ${type}`);
+  let authSent       = false;
+  let wantsRegister  = false;  // FIX: track which command the server wants
+  let primaryTimeout = null;
+  let secondaryTimeout = null;
+
+  function sendAuth(reason) {
+    if (!isRunning || authSent || !botState.connected) return;
+
+    authSent = true;
+    clearTimeout(primaryTimeout);
+    clearTimeout(secondaryTimeout);
+
+    const cmd = wantsRegister
+      ? `/register ${password} ${password}`
+      : `/login ${password}`;
+
+    try {
+      bot.chat(cmd);
+      console.log(`[${botId}] Auto-auth: sent ${cmd.split(' ')[0]} (trigger: ${reason})`);
+    } catch (e) {
+      console.error(`[${botId}] Auto-auth: failed to send command — ${e.message}`);
+      authSent = false;  // Allow retry on error
+    }
+  }
+
+  // FIX: listen on both event types — some servers use JSON chat (messagestr),
+  // others use legacy string chat (message). Previously only messagestr was used.
+  const checkMessage = (msg) => {
+    if (!isRunning || authSent) return;
+    const lower = String(msg).toLowerCase();
+
+    if (lower.includes('/register') || lower.includes('please register')) {
+      wantsRegister = true;  // FIX: mark as register flow before sending
+      sendAuth('register-prompt');
+    } else if (lower.includes('/login') || lower.includes('please login') || lower.includes('please log in')) {
+      wantsRegister = false;
+      sendAuth('login-prompt');
+    }
   };
 
-  bot.on('messagestr', msg => {
-    if (!isRunning || done) return;
-    const lower = msg.toLowerCase();
-    if (lower.includes('/register') || lower.includes('register')) tryAuth('register');
-    else if (lower.includes('/login') || lower.includes('login'))  tryAuth('login');
-  });
+  bot.on('message',    msg => checkMessage(msg.toString()));
+  bot.on('messagestr', msg => checkMessage(msg));
 
-  setTimeout(() => {
-    if (!isRunning || done || !botState.connected) return;
-    tryAuth('login');
+  // FIX: Two-stage fallback to handle the race condition where the server
+  // sends the auth prompt before our listeners are registered.
+  //
+  // Stage 1 (3s): fast path — catches most servers
+  // Stage 2 (8s): slower servers / lag compensation
+  primaryTimeout = setTimeout(() => {
+    if (!isRunning || authSent || !botState.connected) return;
+    console.log(`[${botId}] Auto-auth: no prompt received at 3s — attempting /login`);
+    sendAuth('fallback-3s');
   }, 3_000);
+
+  secondaryTimeout = setTimeout(() => {
+    if (!isRunning || authSent || !botState.connected) return;
+    console.log(`[${botId}] Auto-auth: no prompt received at 8s — attempting /register`);
+    wantsRegister = true;
+    sendAuth('fallback-8s-register');
+  }, 8_000);
 }
+
 
 // ─── Anti-AFK ────────────────────────────────────────────────
 function initAntiAfk() {
