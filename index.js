@@ -1,14 +1,14 @@
 'use strict';
 
 const express = require('express');
-const path = require('path');
-const fs = require('fs');
-const os = require('os');
+const path    = require('path');
+const fs      = require('fs');
+const os      = require('os');
 const { spawn } = require('child_process');
-const http = require('http');
-const https = require('https');
+const http    = require('http');
+const https   = require('https');
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 5000;
 
 // ============================================================
@@ -18,209 +18,208 @@ const CONFIG_PATH = path.join(__dirname, 'bots.json');
 
 function loadConfig() {
   try {
-    const data = fs.readFileSync(CONFIG_PATH, 'utf8');
-    return JSON.parse(data);
+    return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
   } catch (err) {
-    console.error('[Config] Failed to load config:', err.message);
+    console.error('[Config] Failed to load:', err.message);
     return { globalSettings: {}, bots: [] };
   }
 }
 
-function saveConfig(config) {
+function saveConfig(cfg) {
   try {
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8');
     return true;
   } catch (err) {
-    console.error('[Config] Failed to save config:', err.message);
+    console.error('[Config] Failed to save:', err.message);
     return false;
   }
 }
 
-// Initialize config
 let config = loadConfig();
 
 // ============================================================
 // BOT PROCESS MANAGER
 // ============================================================
-const botProcesses = new Map(); // botId -> { process, status, lastUpdate }
-const botStatuses = new Map();   // botId -> status object
 
-// Initialize statuses for all configured bots
-config.bots.forEach(botConfig => {
-  botStatuses.set(botConfig.id, {
-    id: botConfig.id,
-    name: botConfig.name,
-    status: 'stopped',
-    connected: false,
-    playerCount: 0,
-    lastActivity: Date.now(),
-    reconnectAttempts: 0,
-    uptime: 0,
-    coordinates: null,
-    errors: [],
-    lastError: null
-  });
+/**
+ * botProcesses  Map<botId, ProcessEntry>
+ * botStatuses   Map<botId, StatusEntry>
+ *
+ * ProcessEntry  { process: ChildProcess|null, status: string, startTime: number }
+ * StatusEntry   { id, name, status, connected, playerCount, … }
+ */
+const botProcesses = new Map();
+const botStatuses  = new Map();
+
+// Seed statuses — all bots start in "stopped" state on launch
+config.bots.forEach(bc => {
+  botStatuses.set(bc.id, createInitialStatus(bc));
 });
 
+function createInitialStatus(bc) {
+  return {
+    id:                bc.id,
+    name:              bc.name,
+    status:            'stopped',
+    connected:         false,
+    playerCount:       0,
+    lastActivity:      Date.now(),
+    reconnectAttempts: 0,
+    uptime:            0,
+    coordinates:       null,
+    lastError:         null
+  };
+}
+
+// ─── Start ───────────────────────────────────────────────────
 function startBotInstance(botId) {
-  const botConfig = config.bots.find(b => b.id === botId);
-  if (!botConfig) {
-    console.error(`[BotManager] Bot config not found: ${botId}`);
+  const bc = config.bots.find(b => b.id === botId);
+  if (!bc) {
+    console.error(`[BotManager] Config not found: ${botId}`);
     return false;
   }
 
-  // Stop existing process if running
-  stopBotInstance(botId);
+  // Tear down any existing process before starting fresh
+  _killProcess(botId);
 
-  console.log(`[BotManager] Starting bot: ${botConfig.name}`);
+  console.log(`[BotManager] Starting bot: ${bc.name}`);
 
-  const workerPath = path.join(__dirname, 'bot-worker.js');
-  const child = spawn('node', [workerPath], {
+  const child = spawn('node', [path.join(__dirname, 'bot-worker.js')], {
     stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
-    env: {
-      ...process.env,
-      BOT_CONFIG: JSON.stringify(botConfig)
-    }
+    env:   { ...process.env, BOT_CONFIG: JSON.stringify(bc) }
   });
 
-  const processInfo = {
-    process: child,
-    status: 'starting',
-    lastUpdate: Date.now(),
+  botProcesses.set(botId, {
+    process:   child,
+    status:    'starting',
     startTime: Date.now()
-  };
-
-  botProcesses.set(botId, processInfo);
-
-  // Handle IPC messages from worker
-  child.on('message', (msg) => {
-    handleWorkerMessage(botId, msg);
   });
 
-  // Handle stdout
-  child.stdout.on('data', (data) => {
-    console.log(`[${botConfig.name}] ${data.toString().trim()}`);
+  child.on('message', msg => handleWorkerMessage(botId, msg));
+
+  child.stdout.on('data', d => console.log(`[${bc.name}] ${d.toString().trim()}`));
+  child.stderr.on('data', d => console.error(`[${bc.name}] ERR: ${d.toString().trim()}`));
+
+  child.on('error', err => {
+    console.error(`[${bc.name}] Process error:`, err.message);
+    updateBotStatus(botId, { status: 'error', connected: false, lastError: err.message });
   });
 
-  // Handle stderr
-  child.stderr.on('data', (data) => {
-    console.error(`[${botConfig.name}] ERROR: ${data.toString().trim()}`);
-  });
-
-  // Handle process exit
   child.on('exit', (code, signal) => {
-    console.log(`[${botConfig.name}] Process exited with code ${code}, signal ${signal}`);
-
-    const pInfo = botProcesses.get(botId);
-    if (pInfo) {
-      pInfo.status = 'stopped';
-      pInfo.process = null;
+    console.log(`[${bc.name}] Exited — code=${code} signal=${signal}`);
+    const entry = botProcesses.get(botId);
+    if (entry) {
+      entry.status  = 'stopped';
+      entry.process = null;
     }
-
     updateBotStatus(botId, {
-      status: 'stopped',
+      status:    'stopped',
       connected: false,
-      lastError: code !== 0 ? `Process exited with code ${code}` : null
-    });
-  });
-
-  // Handle process error
-  child.on('error', (err) => {
-    console.error(`[${botConfig.name}] Process error:`, err.message);
-    updateBotStatus(botId, {
-      status: 'error',
-      connected: false,
-      lastError: err.message
+      lastError: code !== 0 ? `Exited with code ${code}` : null
     });
   });
 
   return true;
 }
 
+// ─── Stop ────────────────────────────────────────────────────
+/**
+ * Stops a bot instance gracefully.
+ * 1. Sends IPC STOP so the worker sets isRunning=false before doing anything else.
+ * 2. Waits up to 3 s for graceful exit, then SIGTERM → SIGKILL.
+ * @param {string}        botId
+ * @param {Function|null} [callback]
+ */
 function stopBotInstance(botId, callback) {
-  const pInfo = botProcesses.get(botId);
+  const entry = botProcesses.get(botId);
 
-  if (!pInfo || !pInfo.process) {
+  if (!entry || !entry.process) {
     updateBotStatus(botId, { status: 'stopped', connected: false });
-    if (callback) callback();
-    return true;
+    callback?.();
+    return;
   }
 
   console.log(`[BotManager] Stopping bot: ${botId}`);
-
-  pInfo.status = 'stopping';
+  entry.status = 'stopping';
   updateBotStatus(botId, { status: 'stopping', connected: false });
 
-  const proc = pInfo.process;
-  let callbackCalled = false;
+  const proc = entry.process;
+  let settled = false;
 
-  const doCallback = () => {
-    if (callbackCalled) return;
-    callbackCalled = true;
-    pInfo.status = 'stopped';
-    pInfo.process = null;
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    entry.status  = 'stopped';
+    entry.process = null;
     updateBotStatus(botId, { status: 'stopped', connected: false });
-    if (callback) callback();
+    callback?.();
   };
 
-  // Listen for process exit
-  const onExit = () => {
-    proc.removeListener('exit', onExit);
-    doCallback();
-  };
-  proc.on('exit', onExit);
+  // Ask worker to stop cleanly (worker will set isRunning=false immediately)
+  try { proc.send({ type: 'STOP' }); } catch (_) { /* IPC channel already gone */ }
 
-  // Send STOP message via IPC
+  // Settle once the process exits
+  proc.once('exit', () => {
+    clearTimeout(gracefulTimer);
+    settle();
+  });
+
+  // Fallback: forceful termination
+  const gracefulTimer = setTimeout(() => {
+    if (proc.killed) { settle(); return; }
+    console.log(`[BotManager] Graceful timeout — sending SIGTERM to ${botId}`);
+    proc.kill('SIGTERM');
+
+    setTimeout(() => {
+      if (!proc.killed) {
+        console.log(`[BotManager] SIGTERM ignored — sending SIGKILL to ${botId}`);
+        proc.kill('SIGKILL');
+      }
+      settle();
+    }, 5_000);
+  }, 3_000);
+}
+
+/** Hard-kills a process without waiting. Used before restart. */
+function _killProcess(botId) {
+  const entry = botProcesses.get(botId);
+  if (!entry || !entry.process) return;
   try {
-    proc.send({ type: 'STOP' });
-  } catch (e) {
-    // IPC failed, force kill
-  }
+    entry.process.removeAllListeners();
+    entry.process.kill('SIGKILL');
+  } catch (_) {}
+  entry.process = null;
+  entry.status  = 'stopped';
+}
 
-  // Force kill after timeout (3s for graceful, then SIGTERM/SIGKILL)
-  const gracefulTimeout = setTimeout(() => {
-    if (!proc.killed) {
-      console.log(`[BotManager] Force killing bot: ${botId}`);
-      proc.kill('SIGTERM');
+// ─── Restart ─────────────────────────────────────────────────
+function restartBotInstance(botId) {
+  if (!config.bots.find(b => b.id === botId)) return false;
 
-      // Final fallback to SIGKILL after 5s
-      setTimeout(() => {
-        if (!proc.killed) {
-          proc.kill('SIGKILL');
-        }
-        doCallback();
-      }, 5000);
-    } else {
-      doCallback();
-    }
-  }, 3000);
-
-  // Clear timeout if process exits early
-  proc.on('exit', () => {
-    clearTimeout(gracefulTimeout);
+  stopBotInstance(botId, () => {
+    setTimeout(() => startBotInstance(botId), 2_000);
   });
 
   return true;
 }
 
+// ─── IPC message router ──────────────────────────────────────
 function handleWorkerMessage(botId, msg) {
-  if (!msg || !msg.type) return;
+  if (!msg?.type) return;
 
   switch (msg.type) {
-    case 'WORKER_READY':
+    case 'WORKER_READY': {
       console.log(`[BotManager] Worker ready: ${botId}`);
-      const pInfo = botProcesses.get(botId);
-      if (pInfo) {
-        pInfo.status = 'ready';
-        // Send START command
-        pInfo.process.send({ type: 'START' });
+      const entry = botProcesses.get(botId);
+      if (entry?.process) {
+        entry.status = 'ready';
+        // Send START — worker will set isRunning=true and begin connecting
+        entry.process.send({ type: 'START' });
       }
       break;
-
+    }
     case 'STATUS_UPDATE':
-      if (msg.status) {
-        updateBotStatus(botId, msg.status);
-      }
+      if (msg.status) updateBotStatus(botId, msg.status);
       break;
 
     case 'WEBHOOK_EVENT':
@@ -232,518 +231,355 @@ function handleWorkerMessage(botId, msg) {
       break;
 
     default:
-      console.log(`[BotManager] Unknown message from ${botId}:`, msg.type);
+      console.log(`[BotManager] Unknown message from ${botId}: ${msg.type}`);
   }
 }
 
+// ─── Status helpers ──────────────────────────────────────────
 function updateBotStatus(botId, updates) {
-  const status = botStatuses.get(botId);
-  if (!status) {
-    botStatuses.set(botId, { id: botId, ...updates });
+  const current = botStatuses.get(botId);
+  if (!current) {
+    botStatuses.set(botId, { id: botId, ...updates, lastUpdate: Date.now() });
     return;
   }
-
-  Object.assign(status, updates);
-  status.lastUpdate = Date.now();
-}
-
-function restartBotInstance(botId) {
-  const botConfig = config.bots.find(b => b.id === botId);
-  if (!botConfig) return false;
-
-  stopBotInstance(botId, () => {
-    setTimeout(() => startBotInstance(botId), 2000);
-  });
-
-  return true;
+  Object.assign(current, updates, { lastUpdate: Date.now() });
 }
 
 // ============================================================
 // DISCORD WEBHOOK DISPATCHER
 // ============================================================
 const WEBHOOK_RETRY_ATTEMPTS = 3;
-const WEBHOOK_RETRY_DELAY = 5000;
-const pendingWebhooks = [];
+const WEBHOOK_RETRY_DELAY_MS = 5_000;
 
-// Non-blocking webhook dispatch with retry logic
 function dispatchWebhook(botId, payload) {
-  const botConfig = config.bots.find(b => b.id === botId);
-  const globalSettings = config.globalSettings;
+  const bc             = config.bots.find(b => b.id === botId);
+  const webhookUrl     = bc?.webhookUrl || config.globalSettings?.webhookUrl;
 
-  // Determine webhook URL (instance takes precedence over global)
-  let webhookUrl = botConfig?.webhookUrl || globalSettings.webhookUrl;
+  if (!webhookUrl || webhookUrl.includes('YOUR') || webhookUrl.includes('placeholder')) return;
 
-  if (!webhookUrl || webhookUrl.includes('YOUR') || webhookUrl.includes('placeholder')) {
-    return; // No valid webhook configured
-  }
-
-  // Fire-and-forget: send asynchronously without awaiting
   sendWebhookWithRetry(webhookUrl, payload, 0);
 }
 
 function sendWebhookWithRetry(webhookUrl, payload, attempt) {
-  const protocol = webhookUrl.startsWith('https') ? https : http;
   let urlParts;
-
-  try {
-    urlParts = new URL(webhookUrl);
-  } catch (e) {
+  try { urlParts = new URL(webhookUrl); } catch (_) {
     console.error('[Webhook] Invalid URL:', webhookUrl);
     return;
   }
 
-  const botConfig = config.bots.find(b => b.id === payload.botId) || {};
-  const botName = payload.botName || botConfig.name || 'Unknown Bot';
+  const botName  = payload.botName || 'Unknown Bot';
+  const protocol = webhookUrl.startsWith('https') ? https : http;
 
-  const embedData = {
+  const body = JSON.stringify({
     username: botName,
     embeds: [{
-      title: `Event: ${payload.eventType}`,
+      title:       `Event: ${payload.eventType}`,
       description: payload.message || formatEventDescription(payload),
-      color: getEventColor(payload.eventType),
-      timestamp: payload.timestamp,
+      color:       getEventColor(payload.eventType),
+      timestamp:   payload.timestamp,
       fields: [
         { name: 'Server', value: payload.serverIP || 'Unknown', inline: true },
-        { name: 'Bot', value: botName, inline: true }
+        { name: 'Bot',    value: botName,                        inline: true },
+        ...(payload.playerCount != null
+          ? [{ name: 'Players Online', value: String(payload.playerCount), inline: true }]
+          : [])
       ],
       footer: { text: 'Minecraft Bot Manager' }
     }]
-  };
-
-  // Add player count if available
-  if (payload.playerCount !== null && payload.playerCount !== undefined) {
-    embedData.embeds[0].fields.push({
-      name: 'Players Online',
-      value: String(payload.playerCount),
-      inline: true
-    });
-  }
-
-  const postData = JSON.stringify(embedData);
+  });
 
   const options = {
     hostname: urlParts.hostname,
-    port: urlParts.port || (urlParts.protocol === 'https:' ? 443 : 80),
-    path: urlParts.pathname + urlParts.search,
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(postData, 'utf8')
-    }
+    port:     urlParts.port || (urlParts.protocol === 'https:' ? 443 : 80),
+    path:     urlParts.pathname + urlParts.search,
+    method:   'POST',
+    headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
   };
 
-  const req = protocol.request(options, (res) => {
-    if (res.statusCode >= 200 && res.statusCode < 300) {
-      // Success
-    } else {
-      console.log(`[Webhook] HTTP ${res.statusCode} for ${payload.eventType}`);
+  const req = protocol.request(options, res => {
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      console.warn(`[Webhook] HTTP ${res.statusCode} for ${payload.eventType}`);
     }
   });
 
-  req.on('error', (err) => {
-    console.error(`[Webhook] Error (${payload.eventType}, ${botName}, attempt ${attempt + 1}): ${err.message}`);
-
-    // Retry logic
-    if (attempt < WEBHOOK_RETRY_ATTEMPTS - 1) {
-      setTimeout(() => {
-        sendWebhookWithRetry(webhookUrl, payload, attempt + 1);
-      }, WEBHOOK_RETRY_DELAY);
-    } else {
-      console.error(`[Webhook] Failed after ${WEBHOOK_RETRY_ATTEMPTS} attempts: ${payload.eventType}`);
-    }
-  });
-
-  req.setTimeout(10000, () => {
+  req.setTimeout(10_000, () => {
     req.destroy();
     console.error(`[Webhook] Timeout for ${payload.eventType}`);
   });
 
-  req.write(postData);
+  req.on('error', err => {
+    console.error(`[Webhook] Error (attempt ${attempt + 1}): ${err.message}`);
+    if (attempt < WEBHOOK_RETRY_ATTEMPTS - 1) {
+      setTimeout(() => sendWebhookWithRetry(webhookUrl, payload, attempt + 1), WEBHOOK_RETRY_DELAY_MS);
+    } else {
+      console.error(`[Webhook] Giving up after ${WEBHOOK_RETRY_ATTEMPTS} attempts`);
+    }
+  });
+
+  req.write(body);
   req.end();
 }
 
 function formatEventDescription(payload) {
-  const descriptions = {
-    'Connected': `Successfully connected to the server.`,
-    'Disconnected': `Disconnected from the server. ${payload.reason ? `Reason: ${payload.reason}` : ''}`,
-    'PlayerOnServer': `Player(s) detected on server. ${payload.playerNames ? `Players: ${payload.playerNames.join(', ')}` : ''}`,
-    'PlayerLeft': `Server is now empty.`,
-    'BotKicked': `Bot was kicked from the server. Reason: ${payload.reason || 'Unknown'}`,
-    'BotReconnecting': `Attempting to reconnect (attempt ${payload.attempt || 1}). Next retry in ${Math.floor((payload.delay || 0) / 1000)}s.`,
-    'ErrorOccurred': `An error occurred: ${payload.error || 'Unknown error'}`,
-    'BotSpawned': `Bot has spawned in the world.`,
-    'ServerFull': `Bot was rejected - server is full.`,
-    'AuthFailed': `Authentication failed. Check bot credentials.`
+  const map = {
+    Connected:       'Successfully connected to the server.',
+    Disconnected:    `Disconnected. ${payload.reason ? `Reason: ${payload.reason}` : ''}`,
+    PlayerOnServer:  `Player(s) detected. ${payload.playerNames ? `Players: ${payload.playerNames.join(', ')}` : ''}`,
+    PlayerLeft:      'Server is now empty.',
+    BotKicked:       `Kicked. Reason: ${payload.reason || 'Unknown'}`,
+    BotReconnecting: `Reconnecting (attempt ${payload.attempt || 1}). Next in ${Math.floor((payload.delay || 0) / 1000)}s.`,
+    ErrorOccurred:   `Error: ${payload.error || 'Unknown'}`,
+    BotSpawned:      'Bot spawned in the world.',
+    ServerFull:      'Server is full.',
+    AuthFailed:      'Authentication failed.'
   };
-
-  return descriptions[payload.eventType] || `Event: ${payload.eventType}`;
+  return map[payload.eventType] || `Event: ${payload.eventType}`;
 }
 
 function getEventColor(eventType) {
-  const colors = {
-    'Connected': 0x22c55e,      // Green
-    'Disconnected': 0xef4444,   // Red
-    'PlayerOnServer': 0xf59e0b, // Amber
-    'PlayerLeft': 0x22c55e,     // Green
-    'BotKicked': 0xef4444,      // Red
-    'BotReconnecting': 0x3b82f6, // Blue
-    'ErrorOccurred': 0xef4444,  // Red
-    'BotSpawned': 0x22c55e,     // Green
-    'ServerFull': 0xf59e0b,     // Amber
-    'AuthFailed': 0xef4444      // Red
+  const map = {
+    Connected:       0x22c55e,
+    Disconnected:    0xef4444,
+    PlayerOnServer:  0xf59e0b,
+    PlayerLeft:      0x22c55e,
+    BotKicked:       0xef4444,
+    BotReconnecting: 0x3b82f6,
+    ErrorOccurred:   0xef4444,
+    BotSpawned:      0x22c55e,
+    ServerFull:      0xf59e0b,
+    AuthFailed:      0xef4444
   };
-
-  return colors[eventType] || 0x6b7280; // Default gray
+  return map[eventType] || 0x6b7280;
 }
 
 // ============================================================
-// SYSTEM MONITORING (Node.js built-ins only)
+// SYSTEM MONITORING
 // ============================================================
 function getSystemInfo() {
-  const cpus = os.cpus();
+  const cpus     = os.cpus();
   const totalMem = os.totalmem();
-  const freeMem = os.freemem();
-  const usedMem = totalMem - freeMem;
+  const freeMem  = os.freemem();
 
-  // Calculate CPU usage (average across all cores)
-  let totalIdle = 0;
-  let totalTick = 0;
-
+  let totalTick = 0, totalIdle = 0;
   cpus.forEach(cpu => {
-    for (const type in cpu.times) {
-      totalTick += cpu.times[type];
-    }
+    for (const t in cpu.times) totalTick += cpu.times[t];
     totalIdle += cpu.times.idle;
   });
 
-  const totalUsage = totalTick - totalIdle;
-  const cpuUsage = (totalUsage / totalTick) * 100;
-
-  // Process memory
   const processMem = process.memoryUsage();
+  const mb = n => Math.round(n / 1024 / 1024);
 
   return {
-    cpuUsage: Math.round(cpuUsage * 10) / 10,
-    memory: {
-      total: Math.round(totalMem / 1024 / 1024),
-      used: Math.round(usedMem / 1024 / 1024),
-      free: Math.round(freeMem / 1024 / 1024),
-      percentage: Math.round((usedMem / totalMem) * 100)
-    },
-    processMemory: {
-      heapUsed: Math.round(processMem.heapUsed / 1024 / 1024),
-      heapTotal: Math.round(processMem.heapTotal / 1024 / 1024),
-      rss: Math.round(processMem.rss / 1024 / 1024)
-    },
-    uptime: process.uptime(),
-    platform: os.platform(),
-    hostname: os.hostname(),
-    loadAverage: os.loadavg()
+    cpuUsage:      Math.round(((totalTick - totalIdle) / totalTick) * 1000) / 10,
+    memory:        { total: mb(totalMem), used: mb(totalMem - freeMem), free: mb(freeMem), percentage: Math.round(((totalMem - freeMem) / totalMem) * 100) },
+    processMemory: { heapUsed: mb(processMem.heapUsed), heapTotal: mb(processMem.heapTotal), rss: mb(processMem.rss) },
+    uptime:        process.uptime(),
+    platform:      os.platform(),
+    hostname:      os.hostname(),
+    loadAverage:   os.loadavg()
   };
 }
 
 // ============================================================
-// EXPRESS ROUTES
+// EXPRESS MIDDLEWARE & ROUTES
 // ============================================================
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Main dashboard
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
+app.get('/', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
-// UNIFIED STATUS ENDPOINT - System info + all bot statuses
-app.get('/api/status', (req, res) => {
-  const systemInfo = getSystemInfo();
-
-  const botsData = [];
-  config.bots.forEach(botConfig => {
-    const status = botStatuses.get(botConfig.id) || {};
-    const pInfo = botProcesses.get(botConfig.id);
-
-    botsData.push({
-      id: botConfig.id,
-      name: botConfig.name,
-      serverIp: botConfig.serverIp,
-      serverPort: botConfig.serverPort,
-      enabled: botConfig.enabled,
-      running: !!(pInfo && pInfo.process && !pInfo.process.killed),
-      status: status.status || 'stopped',
-      connected: status.connected || false,
-      playerCount: status.playerCount || 0,
-      lastActivity: status.lastActivity,
-      reconnectAttempts: status.reconnectAttempts || 0,
-      uptime: status.uptime || 0,
-      coordinates: status.coordinates,
-      lastError: status.lastError
-    });
+// Unified status
+app.get('/api/status', (_req, res) => {
+  const botsData = config.bots.map(bc => {
+    const status = botStatuses.get(bc.id) || {};
+    const entry  = botProcesses.get(bc.id);
+    return {
+      id:                bc.id,
+      name:              bc.name,
+      serverIp:          bc.serverIp,
+      serverPort:        bc.serverPort,
+      enabled:           bc.enabled,
+      running:           !!(entry?.process && !entry.process.killed),
+      status:            status.status            || 'stopped',
+      connected:         status.connected         || false,
+      playerCount:       status.playerCount        || 0,
+      lastActivity:      status.lastActivity,
+      reconnectAttempts: status.reconnectAttempts  || 0,
+      uptime:            status.uptime             || 0,
+      coordinates:       status.coordinates        || null,
+      lastError:         status.lastError          || null
+    };
   });
 
-  res.json({
-    system: systemInfo,
-    bots: botsData,
-    timestamp: new Date().toISOString()
-  });
+  res.json({ system: getSystemInfo(), bots: botsData, timestamp: new Date().toISOString() });
 });
 
-// Get all bot configurations
-app.get('/api/bots', (req, res) => {
-  res.json(config);
-});
+// Bot CRUD
+app.get('/api/bots', (_req, res) => res.json(config));
 
-// Get single bot configuration
 app.get('/api/bots/:id', (req, res) => {
-  const botConfig = config.bots.find(b => b.id === req.params.id);
-  if (!botConfig) {
-    return res.status(404).json({ error: 'Bot not found' });
-  }
-  res.json(botConfig);
+  const bc = config.bots.find(b => b.id === req.params.id);
+  bc ? res.json(bc) : res.status(404).json({ error: 'Bot not found' });
 });
 
-// Add new bot configuration
 app.post('/api/bots', (req, res) => {
   const newBot = req.body;
-
-  // Validate required fields
   if (!newBot.name || !newBot.serverIp) {
-    return res.status(400).json({ error: 'Name and server IP are required' });
+    return res.status(400).json({ error: 'name and serverIp are required' });
   }
 
-  // Generate unique ID
-  newBot.id = 'bot-' + Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
-
-  // Set defaults
+  newBot.id         = `bot-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
   newBot.serverPort = newBot.serverPort || 25565;
-  newBot.authType = newBot.authType || 'offline';
-  newBot.enabled = newBot.enabled !== false;
-
-  // Ensure nested objects exist
-  newBot.antiAfk = newBot.antiAfk || { enabled: true, sneak: true, swingArm: true };
-  newBot.movement = newBot.movement || { enabled: true, circleWalk: { enabled: true, radius: 5 } };
+  newBot.authType   = newBot.authType   || 'offline';
+  newBot.enabled    = newBot.enabled    !== false;
+  newBot.antiAfk    = newBot.antiAfk    || { enabled: true, sneak: true, swingArm: true };
+  newBot.movement   = newBot.movement   || { enabled: true, circleWalk: { enabled: true, radius: 5 } };
   newBot.playerGuard = newBot.playerGuard || { enabled: true, evictOnPlayer: true };
 
   config.bots.push(newBot);
 
-  if (saveConfig(config)) {
-    // Initialize status
-    botStatuses.set(newBot.id, {
-      id: newBot.id,
-      name: newBot.name,
-      status: 'stopped',
-      connected: false,
-      playerCount: 0,
-      lastActivity: Date.now()
-    });
-
-    res.status(201).json(newBot);
-  } else {
-    config = loadConfig(); // Reload on save failure
-    res.status(500).json({ error: 'Failed to save configuration' });
+  if (!saveConfig(config)) {
+    config = loadConfig();
+    return res.status(500).json({ error: 'Failed to save config' });
   }
+
+  botStatuses.set(newBot.id, createInitialStatus(newBot));
+  res.status(201).json(newBot);
 });
 
-// Update bot configuration
 app.put('/api/bots/:id', (req, res) => {
-  const botId = req.params.id;
-  const updates = req.body;
+  const idx = config.bots.findIndex(b => b.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'Bot not found' });
 
-  const index = config.bots.findIndex(b => b.id === botId);
-  if (index === -1) {
-    return res.status(404).json({ error: 'Bot not found' });
-  }
-
-  // Don't allow ID changes
+  const updates = { ...req.body };
   delete updates.id;
 
-  // Merge updates
-  const existingBot = config.bots[index];
-  config.bots[index] = { ...existingBot, ...updates };
+  config.bots[idx] = { ...config.bots[idx], ...updates };
 
-  if (saveConfig(config)) {
-    // Notify running process of config change
-    const pInfo = botProcesses.get(botId);
-    if (pInfo && pInfo.process) {
-      pInfo.process.send({
-        type: 'UPDATE_CONFIG',
-        config: config.bots[index],
-        restart: true // Request restart if running
-      });
-    }
-
-    res.json(config.bots[index]);
-  } else {
+  if (!saveConfig(config)) {
     config = loadConfig();
-    res.status(500).json({ error: 'Failed to save configuration' });
+    return res.status(500).json({ error: 'Failed to save config' });
   }
+
+  // Notify the running worker of config change
+  const entry = botProcesses.get(req.params.id);
+  if (entry?.process) {
+    try { entry.process.send({ type: 'UPDATE_CONFIG', config: config.bots[idx], restart: true }); } catch (_) {}
+  }
+
+  res.json(config.bots[idx]);
 });
 
-// Delete bot configuration
 app.delete('/api/bots/:id', (req, res) => {
   const botId = req.params.id;
-
-  // Stop bot if running
   stopBotInstance(botId);
 
-  const index = config.bots.findIndex(b => b.id === botId);
-  if (index === -1) {
-    return res.status(404).json({ error: 'Bot not found' });
-  }
+  const idx = config.bots.findIndex(b => b.id === botId);
+  if (idx === -1) return res.status(404).json({ error: 'Bot not found' });
 
-  config.bots.splice(index, 1);
+  config.bots.splice(idx, 1);
   botStatuses.delete(botId);
   botProcesses.delete(botId);
 
-  if (saveConfig(config)) {
-    res.json({ success: true, message: 'Bot deleted' });
-  } else {
+  if (!saveConfig(config)) {
     config = loadConfig();
-    res.status(500).json({ error: 'Failed to save configuration' });
+    return res.status(500).json({ error: 'Failed to save config' });
   }
+
+  res.json({ success: true });
 });
 
-// Start bot instance
+// Bot control
 app.post('/api/bots/:id/start', (req, res) => {
   const botId = req.params.id;
-
-  if (!config.bots.find(b => b.id === botId)) {
-    return res.status(404).json({ error: 'Bot not found' });
-  }
-
-  const success = startBotInstance(botId);
-
-  if (success) {
-    res.json({ success: true, message: 'Bot starting' });
-  } else {
-    res.status(500).json({ error: 'Failed to start bot' });
-  }
+  if (!config.bots.find(b => b.id === botId)) return res.status(404).json({ error: 'Bot not found' });
+  startBotInstance(botId)
+    ? res.json({ success: true, message: 'Bot starting' })
+    : res.status(500).json({ error: 'Failed to start bot' });
 });
 
-// Stop bot instance
 app.post('/api/bots/:id/stop', (req, res) => {
-  const botId = req.params.id;
-
-  stopBotInstance(botId, () => {
-    res.json({ success: true, message: 'Bot stopped' });
-  });
+  stopBotInstance(req.params.id, () => res.json({ success: true, message: 'Bot stopped' }));
 });
 
-// Restart bot instance
 app.post('/api/bots/:id/restart', (req, res) => {
   const botId = req.params.id;
-
-  if (!config.bots.find(b => b.id === botId)) {
-    return res.status(404).json({ error: 'Bot not found' });
-  }
-
+  if (!config.bots.find(b => b.id === botId)) return res.status(404).json({ error: 'Bot not found' });
   restartBotInstance(botId);
   res.json({ success: true, message: 'Bot restarting' });
 });
 
-// Update global settings
+// Settings
 app.put('/api/settings', (req, res) => {
-  const updates = req.body;
-
-  config.globalSettings = { ...config.globalSettings, ...updates };
-
-  if (saveConfig(config)) {
-    res.json(config.globalSettings);
-  } else {
+  config.globalSettings = { ...config.globalSettings, ...req.body };
+  if (!saveConfig(config)) {
     config = loadConfig();
-    res.status(500).json({ error: 'Failed to save settings' });
+    return res.status(500).json({ error: 'Failed to save settings' });
   }
+  res.json(config.globalSettings);
 });
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'running',
-    uptime: process.uptime(),
-    bots: config.bots.length,
-    running: Array.from(botProcesses.values()).filter(p => p.process && !p.process.killed).length
-  });
-});
+// Health / keepalive
+app.get('/health', (_req, res) => res.json({
+  status:  'running',
+  uptime:  process.uptime(),
+  bots:    config.bots.length,
+  running: [...botProcesses.values()].filter(e => e.process && !e.process.killed).length
+}));
 
-// Ping endpoint for keepalive
-app.get('/ping', (req, res) => {
-  res.send('pong');
-});
+app.get('/ping', (_req, res) => res.send('pong'));
 
 // ============================================================
-// SELF-PING FOR RENDER
+// SELF-PING (Render keepalive)
 // ============================================================
-const SELF_PING_INTERVAL = 10 * 60 * 1000;
+(function startSelfPing() {
+  const url = process.env.RENDER_EXTERNAL_URL;
+  if (!url) { console.log('[KeepAlive] Disabled — no RENDER_EXTERNAL_URL'); return; }
 
-function startSelfPing() {
-  const renderUrl = process.env.RENDER_EXTERNAL_URL;
-  if (!renderUrl) {
-    console.log('[KeepAlive] No RENDER_EXTERNAL_URL - self-ping disabled');
-    return;
-  }
-
+  const proto = url.startsWith('https') ? https : http;
   setInterval(() => {
-    const protocol = renderUrl.startsWith('https') ? https : http;
-    protocol.get(`${renderUrl}/ping`, () => {})
-      .on('error', (err) => {
-        console.log(`[KeepAlive] Self-ping failed: ${err.message}`);
-      });
-  }, SELF_PING_INTERVAL);
+    proto.get(`${url}/ping`, () => {}).on('error', err => {
+      console.warn('[KeepAlive] Ping failed:', err.message);
+    });
+  }, 10 * 60 * 1_000);
 
   console.log('[KeepAlive] Self-ping started');
+}());
+
+// ============================================================
+// GRACEFUL SHUTDOWN
+// ============================================================
+function shutdown(signal) {
+  console.log(`[System] ${signal} — shutting down`);
+  botProcesses.forEach((_, botId) => stopBotInstance(botId));
+  setTimeout(() => process.exit(0), 6_000); // allow workers to exit
 }
 
-startSelfPing();
-
-// ============================================================
-// CLEANUP ON EXIT
-// ============================================================
-process.on('SIGTERM', () => {
-  console.log('[System] SIGTERM - shutting down gracefully');
-
-  // Stop all bot processes
-  botProcesses.forEach((pInfo, botId) => {
-    stopBotInstance(botId);
-  });
-
-  process.exit(0);
-});
-
-process.on('SIGINT', () => {
-  console.log('[System] SIGINT - shutting down');
-
-  botProcesses.forEach((pInfo, botId) => {
-    stopBotInstance(botId);
-  });
-
-  process.exit(0);
-});
-
-// ============================================================
-// NO AUTO-START ON LAUNCH
-// Bots must be manually started via the dashboard or API
-// The 'enabled' flag indicates the bot config is active/available,
-// NOT that it should auto-connect on app startup
-// ============================================================
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
 
 // ============================================================
 // START SERVER
 // ============================================================
+// Bots do NOT auto-connect on server start.
+// Each bot must be started explicitly via the dashboard or API.
+// ============================================================
+
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log('='.repeat(50));
-  console.log('  Minecraft Bot Manager v3.0');
-  console.log('  Dashboard: http://localhost:' + server.address().port);
+  console.log('  Minecraft Bot Manager v4.0');
+  console.log(`  Dashboard: http://localhost:${server.address().port}`);
   console.log('='.repeat(50));
   console.log(`Config: ${CONFIG_PATH}`);
-  console.log(`Bots configured: ${config.bots.length}`);
+  console.log(`Bots configured: ${config.bots.length} (none auto-started)`);
   console.log('='.repeat(50));
 });
 
-server.on('error', (err) => {
+server.on('error', err => {
   if (err.code === 'EADDRINUSE') {
-    const fallbackPort = PORT + 1;
-    console.log(`Port ${PORT} in use - trying ${fallbackPort}`);
-    server.listen(fallbackPort, '0.0.0.0');
+    console.warn(`Port ${PORT} in use — retrying on ${PORT + 1}`);
+    server.listen(PORT + 1, '0.0.0.0');
   } else {
-    console.error('Server error:', err.message);
+    console.error('[Server] Fatal error:', err.message);
   }
 });
