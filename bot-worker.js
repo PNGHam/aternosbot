@@ -837,8 +837,6 @@ process.on('uncaughtException', (err) => {
     botState.status = 'stopped';
     return;
   }
-
-  setTimeout(() => scheduleReconnect('crash'), 5000);
 });
 
 process.on('unhandledRejection', (reason) => {
